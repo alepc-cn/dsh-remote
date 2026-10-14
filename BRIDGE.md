@@ -61,3 +61,20 @@ DSH 桌面端"发文件"是两套机制：
 ## 6. 不做
 
 - 不搬目录；不搬超限大文件；不改 DSH 配置；不自造路由/密钥；只处理消息里出现的本机路径。
+
+## 7. 实现事实（0.11.8，全部真机实测）
+
+| 项 | 事实 |
+|---|---|
+| 投递通道 | 官方 `POST /api/session/uploadFileBinary?sessionId=<会话>`，`application/octet-stream`；认证由对面 DSH 栅栏（会话 cookie）负责 |
+| 成功响应（实测） | `{"ok":true,"value":{"receiptId":"…","file":{"attachmentId":"sha256:…","name":"…","bytes":N}}}` |
+| 落点（实测） | `~/.dsh/attachments/v1/files/<前两位>/<sha256>/<原文件名>` + `file-objects/<前两位>/<sha256>`（内容寻址，同内容去重） |
+| 改写 | **纯文本**：`<文件名>（已从<源设备>搬到<目标设备>附件库：sha256:…）`。**不追加内容段** —— 实测 prompt 的 content 只接受 text/image，`{type:"file",…}` 会被网关 boundary 校验拒掉、整条消息发废 |
+| 请求体处理 | 解析 → 在 JS 字符串上替换 → 重新序列化（不在原始 JSON 文本上 split/join；否则长度/转义会把请求体弄坏） |
+| 开关 | **默认关闭**：数据目录出现 `dsh-remote-bridge.enabled` 才启用；另有 `dsh-remote-bridge.dryrun`（只记录不改写） |
+| 排查 | `dsh-remote-bridge.log` 记每步决策（含改写前后字节数）；`dsh-remote-bridge-in/out.json` 存进出请求体（诊断用） |
+| 失败语义 | 任何失败**原样转发** + 记日志；体超上限（8 MiB）回 413；单文件上限 256 MiB |
+
+### 验收（已通过，2026-10-15）
+
+① 新开对话 → ② 发 `F:\…txt` → ③ 消息出现「（已从<源设备>搬到<目标设备>附件库：sha256:…）」→ ④ 目标机按该 id 读到文件且 **sha256 与源文件逐字节一致** → ⑤ 越界情形按约定退化（自测覆盖）。

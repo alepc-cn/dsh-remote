@@ -1,6 +1,6 @@
 # dsh-remote
 
-在你自己的一台电脑上，远程控制使用另一台电脑的 DSH：切换会话、用终端、取文件。
+在你自己的一台电脑上，直接用另一台电脑的 DSH：切换会话、用终端、取文件。
 
 ## 解决了什么
 
@@ -12,7 +12,7 @@
 ## 安装（每台电脑都要装）
 
 ```bash
-dsh plugin --profile desktop add <你的 tgz 地址>
+dsh plugin --profile desktop add https://github.com/alepc-cn/dsh-remote/releases/latest/download/dsh-remote.tgz
 ```
 
 装完**重启一次 DSH**，然后到 **设置 →「远程连接」→「配置」**：

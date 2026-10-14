@@ -626,7 +626,9 @@ async function startStubRemote({ token = "stub-token", secretCookie = "stub-sess
 		if (url.pathname === "/fake-html") {
 			// content-type 撒谎成 JSON、响应体却是 HTML：I1 的第二道判定（嗅探）要能拦住。
 			res.writeHead(200, { "content-type": "application/json" });
-			res.end("\n  <!DOCTYPE html><html><head></head><body>SNEAKY-HTML</body></html>");
+			// 0.10.8：前面塞 120 字节空白 —— **专测报告的"前置空白把判定挤出 64 字节嗅探窗口"**：
+			// 老代码在前 64 字节全空白时判定退化成 maybe，响应体又在 4096 以内 → end 分支无条件放行。
+			res.end("\n  " + " ".repeat(120) + "<!DOCTYPE html><html><head></head><body>SNEAKY-HTML</body></html>");
 			return;
 		}
 		if (url.pathname.startsWith("/api/")) {
@@ -1334,7 +1336,7 @@ async function main() {
 	check("上游首页请求没有被强制 accept-encoding: identity（HTML 不再需要缓冲注入）",
 		stub.requests.some((request) => request.url === "/" && request.acceptEncoding !== "identity"));
 
-	section("A2（I1 第二道）content-type 撒谎成 JSON、响应体却是 HTML → 同样拦截");
+	section("A2（I1 第二道）content-type 撒谎成 JSON、响应体却是 HTML → 同样拦截；含**前置 120 字节空白**的变体（报告的绕过路径）");
 	const sneaky = await httpGet(`http://127.0.0.1:${host.port}/dev/self/fake-html`);
 	check("状态 404 且不是 text/html",
 		sneaky.status === 404 && !internals.isHtmlContentType(String(sneaky.headers.get("content-type"))),

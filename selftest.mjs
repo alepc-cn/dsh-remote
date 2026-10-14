@@ -29,7 +29,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { createServer, request as httpRequest } from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import { apply, inject, internals, name as pluginName } from "./lib/index.js";
 
@@ -343,6 +343,7 @@ function createRemoteApi(options = {}) {
 		readBytesCalls: [],
 		createCalls: [],
 		promptCalls: [],
+	uploads: [],
 		renameCalls: [],
 		workspaceCalls: [],
 		/** 被真正处理（不是 generic 兜底）的 endpoint 顺序 —— 分叉的"先工作区、后建会话、再改名、最后发种子"靠它验。 */
@@ -635,6 +636,32 @@ async function startStubRemote({ token = "stub-token", secretCookie = "stub-sess
 			// 空响应体（附件上传/状态更新这类 POST 成功后的常态）：**绝不能被 I1 拦掉**。
 			res.writeHead(200, { "content-type": "application/json" });
 			res.end();
+			return;
+		}
+		if (url.pathname === "/api/session/uploadFileBinary") {
+			// 官方原始字节上传路由（0.11.0 跨机附件搬运走的就是它）：记录字节与元数据。
+			const record = {
+				sessionId: url.searchParams.get("sessionId"),
+				name: url.searchParams.get("name"),
+				contentType: req.headers["content-type"],
+				authed,
+				chunks: [],
+			};
+			req.on("data", (chunk) => record.chunks.push(chunk));
+			req.on("end", () => {
+				record.bytes = Buffer.concat(record.chunks);
+				delete record.chunks;
+				api.uploads.push(record);
+				res.writeHead(200, { "content-type": "application/json" });
+				// 真机形状（0.11.0 探针实测）：{ok:true, value:{receiptId, file:{attachmentId, name, bytes}}}
+				res.end(JSON.stringify({
+					ok: true,
+					value: {
+						receiptId: "receipt-1",
+						file: { attachmentId: "sha256:deadbeef", name: record.name ?? "file", bytes: record.bytes.length },
+					},
+				}));
+			});
 			return;
 		}
 		if (url.pathname.startsWith("/api/")) {
@@ -1353,6 +1380,61 @@ async function main() {
 	const emptyBody = await httpGet(`http://127.0.0.1:${host.port}/dev/self/api/empty`);
 	check("**空响应体**照样放行（附件上传那类 POST 成功后就是空体；这里被拦就会让上传失败）",
 		emptyBody.status === 200 && emptyBody.body === "", `status=${emptyBody.status} body=${JSON.stringify(emptyBody.body.slice(0, 40))}`);
+
+	section("A3（0.11.1 跨机附件搬运）消息里的**本机**路径 → 自动搬到对面并改写");
+	// 0.11.1 起桥接**默认关闭**：用例先放标记文件打开它（跑完删掉）
+	const bridgeMarker = join(dirname(dataFile), "dsh-remote-bridge.enabled");
+	writeFileSync(bridgeMarker, "on", "utf8");
+	const bridgeDir = mkdtempSync(join(workDir, "bridge-"));
+	const bridgeFile = join(bridgeDir, "报告 草稿.md");
+	writeFileSync(bridgeFile, "BRIDGE-CONTENT-1234", "utf8");
+	const promptBody = {
+		method: "session/prompt",
+		payload: {
+			args: {
+				request: {
+					requestId: "req-bridge-1",
+					sessionId: "sess-bridge",
+					mode: "queue",
+					// 桌面端对带空格的路径会加引号（formatFileMention）：这里按真实写法测
+					content: [{ type: "text", text: `看这个 @${'"'}${bridgeFile}${'"'} 谢谢` }],
+				},
+			},
+		},
+	};
+	await httpJson(`http://127.0.0.1:${host.port}/dev/self/api/session/prompt`, { method: "POST", body: promptBody });
+	await new Promise((resolve) => setTimeout(resolve, 80));
+	const upload = stub.api.uploads.at(-1);
+	check("搬运：本机文件字节原样投到对面的 /api/session/uploadFileBinary（octet-stream + sessionId + 带会话 cookie）",
+		upload !== undefined
+		&& upload.sessionId === "sess-bridge"
+		&& upload.contentType === "application/octet-stream"
+		&& upload.authed === true
+		&& upload.bytes.toString("utf8") === "BRIDGE-CONTENT-1234",
+		upload === undefined
+			? "(对面没收到上传)"
+			: `sessionId=${String(upload.sessionId)} type=${String(upload.contentType)} authed=${String(upload.authed)} bytes=${String(upload.bytes.length)}`);
+	check("搬运：日志记下「本机路径 → 附件 <名字>（…，sha256:…）」",
+		router.logs.some((line) => line.includes("跨机搬运") && line.includes("sha256:deadbeef")),
+		router.logs.filter((line) => line.includes("跨机搬运")).at(-1) ?? "(没有搬运日志)");
+	check("搬运：**不再**追加内容段（0.11.2 起纯文本改写；追加 file 段会被网关 boundary 校验拒掉、把消息发废）",
+		router.logs.every((line) => !line.includes("已挂")),
+		router.logs.filter((line) => line.includes("跨机搬运")).at(-1) ?? "(没有搬运日志)");
+	check("搬运：改写完成并报了字节数（说明重序列化后的体是正常的）",
+		router.logs.some((line) => line.includes("改写完成") && /[0-9]+ 字节/u.test(line)),
+		router.logs.filter((line) => line.includes("改写完成")).at(-1) ?? "(没有改写日志)");
+	check("搬运：对面确实收到了这次 prompt（转发没被桥接打断）",
+		stub.requests.some((request) => request.method === "POST" && request.url === "/api/session/prompt"),
+		JSON.stringify(stub.requests.map((request) => request.url).slice(-4)));
+	// 默认关闭的行为：拿掉标记文件后，同样的请求必须**一个字都不改**
+	rmSync(bridgeMarker, { force: true });
+	const uploadsBefore = stub.api.uploads.length;
+	await httpJson(`http://127.0.0.1:${host.port}/dev/self/api/session/prompt`, { method: "POST", body: promptBody });
+	await new Promise((resolve) => setTimeout(resolve, 60));
+	check("默认关闭：没有标记文件时桥接完全不动作（不上传、不报错、请求照常转发）",
+		stub.api.uploads.length === uploadsBefore
+		&& stub.requests.filter((request) => request.url === "/api/session/prompt").length === 2,
+		`uploads=${String(stub.api.uploads.length)} prompt 次数=${String(stub.requests.filter((request) => request.url === "/api/session/prompt").length)}`);
 
 	// ------------------------------------------------------------------
 	// B：API 透传 + token/jar

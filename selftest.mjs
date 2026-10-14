@@ -1434,7 +1434,26 @@ async function main() {
 	check("默认关闭：没有标记文件时桥接完全不动作（不上传、不报错、请求照常转发）",
 		stub.api.uploads.length === uploadsBefore
 		&& stub.requests.filter((request) => request.url === "/api/session/prompt").length === 2,
+
+
 		`uploads=${String(stub.api.uploads.length)} prompt 次数=${String(stub.requests.filter((request) => request.url === "/api/session/prompt").length)}`);
+
+	// 回归（0.11.10）：正文里的**裸路径**（前面没有 @）绝不搬运、绝不改写
+	writeFileSync(bridgeMarker, "on", "utf8");
+	const BS = String.fromCharCode(92);
+	const barePath = ["C:", "Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"].join(BS);
+	const uploadsBeforeBare = stub.api.uploads.length;
+	const bareBody = {
+		method: "session/prompt",
+		payload: { args: { request: { requestId: "req-bare-1", sessionId: "sess-bridge", mode: "queue",
+			content: [{ type: "text", text: `解释一下这个路径 ${barePath} 是干嘛的` }] } } },
+	};
+	await httpJson(`http://127.0.0.1:${host.port}/dev/self/api/session/prompt`, { method: "POST", body: bareBody });
+	await new Promise((resolve) => setTimeout(resolve, 60));
+	check("正文里的裸路径不搬运、不改写（只有 @ 文件提及才算附件）",
+		stub.api.uploads.length === uploadsBeforeBare,
+		`uploads=${String(stub.api.uploads.length)}`);
+	rmSync(bridgeMarker, { force: true });
 
 	// ------------------------------------------------------------------
 	// B：API 透传 + token/jar
@@ -2266,7 +2285,7 @@ async function main() {
 	const state = stateResponse.json;
 	check("状态 200 且是 JSON", stateResponse.status === 200 && state !== null, `status=${stateResponse.status}`);
 	check("顶层字段集合正好是契约里那 7 个（顺序无关）",
-		JSON.stringify(Object.keys(state).sort()) === JSON.stringify(["access", "devices", "diagnostics", "edge", "enabled", "localDevice", "version"]),
+		JSON.stringify(Object.keys(state).sort()) === JSON.stringify(["access","bridge","devices","diagnostics","edge","enabled","localDevice","version"]),
 		Object.keys(state).join(","));
 	check("enabled 是布尔、version 是本包版本", state.enabled === true && state.version === internals.VERSION,
 		`enabled=${String(state.enabled)} version=${String(state.version)}`);

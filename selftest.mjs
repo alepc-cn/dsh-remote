@@ -631,6 +631,12 @@ async function startStubRemote({ token = "stub-token", secretCookie = "stub-sess
 			res.end("\n  " + " ".repeat(120) + "<!DOCTYPE html><html><head></head><body>SNEAKY-HTML</body></html>");
 			return;
 		}
+		if (url.pathname === "/api/empty") {
+			// 空响应体（附件上传/状态更新这类 POST 成功后的常态）：**绝不能被 I1 拦掉**。
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end();
+			return;
+		}
 		if (url.pathname.startsWith("/api/")) {
 			if (!authed) {
 				req.resume();
@@ -1344,6 +1350,9 @@ async function main() {
 	check("响应体不含 SNEAKY-HTML", !sneaky.body.includes("SNEAKY-HTML"));
 	check("日志里记录了「响应体开头看起来是 HTML」",
 		router.logs.some((line) => line.includes("拦截 HTML 响应") && line.includes("看起来是 HTML")));
+	const emptyBody = await httpGet(`http://127.0.0.1:${host.port}/dev/self/api/empty`);
+	check("**空响应体**照样放行（附件上传那类 POST 成功后就是空体；这里被拦就会让上传失败）",
+		emptyBody.status === 200 && emptyBody.body === "", `status=${emptyBody.status} body=${JSON.stringify(emptyBody.body.slice(0, 40))}`);
 
 	// ------------------------------------------------------------------
 	// B：API 透传 + token/jar

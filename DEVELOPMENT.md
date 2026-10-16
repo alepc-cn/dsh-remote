@@ -1471,3 +1471,60 @@ Node 24 自带的 undici `WebSocket` 客户端打不开"合成握手"（**直连
 
 4. 回退到 device-switch：把数据文件里的 `devices` 抄回 profile 的 `config.devices`（含 `token`）即可
    —— 两者的设备形状（`{id,name,url}`）是刻意保持一致的。
+
+---
+
+## 十、远端目录流（0.11.15）：接管「添加工作区…」的目录选择
+
+**要修的行为**：在 A 的窗口里切到 B，点「添加工作区…」时弹出的是 **A 本机**的系统文件夹窗口（工作区却要建在 B）。
+
+**机制（全部走官方 seam：不做 DOM 硬插、不改壳、不改 DSH 配置）**：
+
+- 「添加工作区…」的目录选择是两个子 slot：`conversation.hero.workspace.directoryFlow` 与
+  `sidebar.workspaces.directoryFlow`，都是 `kind: "single"`；占据方契约（client inspect 的
+  `DirectoryFlowOwnerProps`）：`open / busy / onPicked(path) / onCancel() / onError(message)`。
+- slot 引擎 `entriesOfSlot()` 按 **priority 升序**取每格第一个存活条目；同优先级重复注册会抛错，
+  报错文案自己写着「register at a different priority to shadow it (lowest renders)」。
+  ⇒ 我们用 `priority: -1` **遮蔽**官方占据方（它在 0）：不卸载它、**本机模式下干脆不注册**。
+- 官方占据方是谁：`dsh-host-directory-picker-auto` 在**服务端启动时**按事实解析 ——
+  `bindHost !== "127.0.0.1"` → `browse`（应用内浏览），否则 win32/darwin → `native`（无渲染驱动）。
+  `native` 的 client half 的 `pick` 只有两条路：① 页面里有桌面壳注入的 `globalThis.__DSH_DIRECTORY_PICKER__`
+  → 弹**本机**系统窗口（这次的 bug 本体）；② 没有那个全局 → `uiWorkspace.pickDirectory()` 走 RPC 去对面开系统对话框。
+  两条路都不是"让你在这台选对面的目录"。
+- 我们的占据方：**远端模式**（`localStorage["dsh-device-switch:current"]` 有值）下注册；数据源用官方 browse
+  占据方那一对方法 `uiWorkspace.listDirectory / createDirectory`（远端模式下垫片把 api 流量改道到对面那台），
+  渲染成自己的应用内对话框（内联样式 + `--dsw-alias-*` 主题 token）。
+  对面解析成 `native` 时 `list` 会以 `directory-picker/unavailable` 被拒 ⇒ 对话框写明原因，并给
+  **直接输入对面绝对路径**的兜底（不依赖对面任何后端）。
+
+**几个不许回退的实现细节**：
+
+- **对面是 `native` 后端（列不出目录）时必须给能点的东西**，而不是只丢一句报错：官方 `list` 报的是英文
+  （`directoryPicker.list needs the browse capability; the composed picker serves "native"`），界面上换成中文说明
+  （**不把官方英文原文抛给用户**——用户实测截图点名了这条），并且给两条路：
+  ① 列出"对面**已有工作区**的目录"当候选 —— 来源是**客户端自己的会话快照**
+  `ctx.sessions.list.getSnapshot().byId[*].cwd`（远端模式下这份快照本来就是对面那台的；官方
+  `dsh-client-ui-chat` 也是这么读 `cwd` 的），去重、排序、最多 8 条，点一下就 `onPicked`；
+  ② 保留"直接输入绝对路径"。另外这种限制下"重试"必然同样结果 ⇒ **不摆那个按钮**。
+  ⇒ 候选来自客户端快照，所以**不需要任何新网络入口**（比自建 peer 目录通道更保守，也不用对面改配置）；
+  代价是只能列"已经有工作区的目录"，其余要手输。
+- 「读取中」必须**派生**（`view.token !== wanted.token`），**不许**在 effect 里同步 setState 去写它：
+  那会立刻触发一次重渲染，本轮 effect 的清理函数随即把在途请求的 `alive` 关掉，回调永远落不了地
+  —— 这是自测抓到的真实时序 bug（表现：永远停在"读取中…"）。
+- **选中的设备是"本机自己"那一台时必须交回官方**：设备表里每条设备都带 `local: device === runtime.localDevice`
+  （宿主半 `buildDevices`），而 `localStorage` 里的切换键**只表示"选了谁"**（本机 = 删键），所以"选了自己那台"
+  是可能存在的一态（本次实测公司台的 `remote-devices.json` 里 `current: "company"` 就是自己）。
+  那一态下官方占据方走的是桌面壳的系统对话框（本机、好用），而我们自己的列表会因为"本机 = 回环 + native 后端"失败
+  ⇒ 组件在 `open` 时先读 `/state`：目标带 `local:true` 就**不列目录、不渲染自己的弹窗**，直接 `pickDirectory()` 把结果
+  交给 owner；设备表读不到则按"对面"处理（照常列目录，名字退化成 id）。
+- 设备名那一路（`GET /plugin/remote/state`）**不挂 alive**：它与请求 token 无关，重渲染作废旧闭包时也不该丢结果；
+  取不到就显示设备 id，**不编名字**。
+- 两个洞各自要 `ctx.slots.inject()`（声明可能晚于我们激活、还可能被替换），官方占据方也是这么嵌套的；
+  `inject` 回调允许返回**多个 disposer 的可迭代对象**，所以一次注册两个洞是返回数组。
+- `apply` 里接管放**最后**并包 try/catch：接管失败只记一条 `console.warn`，设置页与两个菜单项照常工作。
+- 客户端半只准用 `useState/useEffect`（自测的假 react 对 `useRef/useMemo/useCallback` 直接抛错）。
+- 自测里首次加载必须用 `loadFlow()`（**先渲染再等 promise**）：`settleRenders()` 是"先 await 再 render"，
+  冷启动那轮请求还没发出就已经判定"没有新写入"并 break，会误报成"卡在读取中"。
+
+**部署特性**：这一节只动**客户端半**（`lib/client.js`）⇒ 两台覆盖文件后**重载一次窗口**即可
+（宿主半没动，不必重启 DSH；版本号一起进 `package.json` / `lib/index.js` 只为体检显示一致）。

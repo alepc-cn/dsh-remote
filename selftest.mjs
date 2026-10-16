@@ -27,7 +27,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
-import { connect } from "node:net";
+import { connect, createServer as netCreateServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createContext, runInContext } from "node:vm";
@@ -1054,6 +1054,9 @@ function createFakeDom() {
 	const body = createElement("body");
 	const document = {
 		readyState: "complete",
+		// `body` 与 `getElementById` 都按**真浏览器**的形状给：垫片"一个 DOM 节点都不插"这条
+		// 不变式要能直接断言 `body.children`（垫片历史上那几块 UI —— 右下角胶囊、兜底浮层、
+		// 左上角按钮 —— 全都已整段删除）。
 		body,
 		documentElement: createElement("html"),
 		baseURI: "http://127.0.0.1:19387/",
@@ -1076,7 +1079,7 @@ function createFakeDom() {
  * 垫片的**自检**（同步 patch 之后异步 GET 一次 `statePath`）也靠这里的假 fetch 喂：
  * `stateStatus=404` 模拟"插件已卸载"，`stateBody` 默认 `{enabled:true}`。
  */
-function createShimSandbox({ current, devices, location, transport, baseURI, stateStatus = 200, stateBody = { enabled: true } } = {}) {
+function createShimSandbox({ current, devices, location, transport, baseURI, stateStatus = 200, stateBody = { enabled: true }, viewState } = {}) {
 	const calls = { fetch: [], sockets: [], xhr: [], reloads: 0 };
 	const storage = new Map();
 	if (current !== undefined && current !== null) storage.set(internals.STORAGE_KEYS.current, current);
@@ -1100,6 +1103,24 @@ function createShimSandbox({ current, devices, location, transport, baseURI, sta
 				status: stateStatus,
 				url: target,
 				json: () => Promise.resolve(stateBody),
+			});
+		}
+		// 浏览器口（0.12.0 的可达性自愈探的就是它）：`viewState.peers` 可随时改（测"连续两次"）。
+		if (viewState !== undefined && target === internals.VIEW_PATH) {
+			const status = viewState.status === undefined ? 200 : viewState.status;
+			if (status !== 200) {
+				return Promise.resolve({ ok: false, status, url: target, json: () => Promise.resolve(null) });
+			}
+			return Promise.resolve({
+				ok: true,
+				status: 200,
+				url: target,
+				json: () => Promise.resolve({
+					at: 1,
+					self: { name: "本机", live: { running: 0, pending: 0, unread: false, doneAt: 0, at: 1 } },
+					peers: Array.isArray(viewState.peers) ? viewState.peers : [],
+					version: internals.VERSION,
+				}),
 			});
 		}
 		return Promise.resolve({
@@ -1135,6 +1156,14 @@ function createShimSandbox({ current, devices, location, transport, baseURI, sta
 		pathname: "/",
 		reload() { calls.reloads += 1; },
 	};
+	// 自测传进来的 location 也一样能数刷新次数（可达性自愈要看"到底刷没刷"）。
+	if (location !== undefined && location !== null && typeof location.reload === "function") {
+		const inner = location.reload;
+		location.reload = function patchedReload() {
+			calls.reloads += 1;
+			return inner.call(this);
+		};
+	}
 	const sandbox = {
 		console,
 		URL,
@@ -1177,6 +1206,102 @@ function fetchTarget(box, input, init) {
 	void box.sandbox.fetch(input, init);
 	const record = box.calls.fetch[before];
 	return typeof record.input === "string" ? record.input : record.input.url;
+}
+
+/**
+ * 垫片历史上那颗「右下角设备切换胶囊」的 DOM id。**那段代码与这个常量在 0.12.0 已整段删除**
+ * （宿主半不再导出它），所以这里是**测试本地的字面量**：专门用来盯"这些节点一个都不许出现"。
+ */
+const PILL_ELEMENT_ID = "dsh-remote-root";
+
+/**
+ * 「右下角设备切换胶囊」**整段删除**之后的契约：DOM 里不该有 shim 容器 / `-panel` / `-toggle`
+ * 任何一个节点，body 下也不该多出任何该前缀的顶层节点（= 一点 UI 都不画）。
+ * 删掉的只是**画 UI**：请求改写与 localStorage 键那两套照旧（各自由别的断言盯着）。
+ */
+function noShimUi(box) {
+	const id = PILL_ELEMENT_ID;
+	const topLevel = box.dom.body.children.filter((node) => typeof node.id === "string" && node.id.startsWith(id));
+	return box.dom.findById(id) === null
+		&& box.dom.findById(`${id}-panel`) === null
+		&& box.dom.findById(`${id}-toggle`) === null
+		&& topLevel.length === 0;
+	// 注：**垫片一个可见 DOM 节点都不插**，所以"body 下什么都没有"另外由 K1 ④ 那条直接断言。
+}
+
+/**
+ * 2026-10-17 那个致死缺陷补丁的自测夹具：给垫片沙箱装上**可控时钟**
+ * （`setTimeout` / `setInterval` / `clearTimeout` / `clearInterval` / `Date.now`）。
+ *
+ * 为什么还要它：自愈的冷却标记写成 `{at: 0}`，而 `resetToLocal` 是拿 `Date.now()` 与它比 ——
+ * 把 `Date.now()` 钉在虚拟的 0 上，"冷却窗口内不重复 reset"才是确定的（真实墙钟下这个用例必红）。
+ * 0.12.0 起垫片在**非回环会话**里会登记一条 2 秒的可达性探测（`setInterval`），
+ * 所以这里也提供 `setInterval` / `clearInterval`，并且 `advance()` 会按周期**重复**触发它。
+ */
+function withShimClock(box) {
+	const handles = new Map();
+	let next = 1;
+	let now = 0;
+	box.clock = {
+		now: () => now,
+		/** 推进虚拟时钟并**按到点顺序（同刻按登记顺序）**跑回调；周期定时器会自动续下一个到点。 */
+		advance: async (ms) => {
+			now += Number(ms) || 0;
+			for (let guard = 0; guard < 500; guard += 1) {
+				const due = [...handles.entries()].filter(([, entry]) => entry.at <= now).sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0];
+				if (due === undefined) break;
+				if (due[1].every > 0) due[1].at += due[1].every;
+				else handles.delete(due[0]);
+				due[1].fn();
+				// 探测的回调里有 fetch → json() 两层 promise，多清几轮微任务再跑下一个到点。
+				for (let round = 0; round < 6; round += 1) await Promise.resolve();
+			}
+		},
+		pending: () => handles.size,
+	};
+	box.sandbox.setTimeout = (fn, ms) => {
+		const handle = next;
+		next += 1;
+		handles.set(handle, { fn, at: now + (Number(ms) || 0), every: 0 });
+		return handle;
+	};
+	box.sandbox.clearTimeout = (handle) => {
+		handles.delete(handle);
+	};
+	box.sandbox.setInterval = (fn, ms) => {
+		const handle = next;
+		next += 1;
+		const every = Number(ms) || 0;
+		handles.set(handle, { fn, at: now + every, every });
+		return handle;
+	};
+	box.sandbox.clearInterval = (handle) => {
+		handles.delete(handle);
+	};
+	box.sandbox.Date = Object.assign(function FakeDate() {}, { now: () => now });
+	return box;
+}
+
+/**
+ * 把一次"活着的加载"配齐：起沙箱 → 跑垫片。
+ *
+ * **可控时钟仍然要给**：自愈里的冷却标记是 `{at: 0}`（`Date.now()` 与它比），钉住虚拟时钟
+ * 才能确定地测"冷却窗口内不重复 reset"。0.12.0 起非回环会话里还会登记一条 2 秒探测，
+ * 所以 `advance()` 在这里也是"让它探第 N 次"的手段（`location` / `viewState` 可透传）。
+ */
+function bootShimWithClock(options) {
+	const box = withShimClock(createShimSandbox({
+		current: options?.current,
+		devices: options?.deviceSeed,
+		location: options?.location,
+		viewState: options?.viewState,
+	}));
+	runShim(box, internals.renderShimScript({
+		devices: options?.devices ?? [{ id: "home", name: "家里台" }, { id: "office", name: "办公室台" }],
+		localName: "本机",
+	}));
+	box.slot = box.sandbox.__DSH_REMOTE_SHIM__;
+	return box;
 }
 
 const SHIM_PAYLOAD = { devices: [{ id: "home", name: "设备B" }, { id: "company", name: "设备A" }], localName: "本机" };
@@ -1556,10 +1681,204 @@ async function main() {
 		typeof upgradeSeen?.cookie === "string" && upgradeSeen.cookie.startsWith(internals.cookieNameFor(stub.authority)),
 		upgradeSeen?.cookie ?? "(none)");
 	check("未改写 Upgrade/Connection 语义（远端看到 upgrade: websocket）", upgradeSeen?.upgrade === "websocket", upgradeSeen?.upgrade);
+	// 2026-10-17 第二刀：这台设备在上面 E4 里刚被判过不可达 ⇒ 升级请求走**快失败**那条路
+	//（账本新鲜时**不发上游连接**，直接优雅 destroy：一个字节都不回）。
+	// 这里先用插件自己的连通性测试接口把账本**确定地**刷成"刚判过不可达"，用例才不依赖
+	// "E4 到现在还没过 4 秒"这种时间巧合。
+	const downProbe = await httpJson(`http://127.0.0.1:${host.port}${internals.PLUGIN_ROUTE}/test/down`, { method: "POST", body: {} });
+	check("连通性测试接口确认这台连不上（账本里 reachable=false 且新鲜）",
+		downProbe.status === 200 && downProbe.json.ok === false, JSON.stringify(downProbe.json));
 	const upgradeDown = await rawUpgradeProbe({ port: host.port, path: "/dev/down/api/remote.mux" });
-	check("连不上的设备的升级请求收到 HTTP 502（不是把连接挂死）",
-		upgradeDown.received.toString("latin1").startsWith("HTTP/1.1 502 Bad Gateway"),
+	check("刚判过不可达的设备：升级请求被**优雅关闭**（一个字节都不回 —— 既没把连接挂死，也不是 HTML）",
+		upgradeDown.received.length === 0,
 		JSON.stringify(upgradeDown.received.toString("latin1").slice(0, 60)));
+
+	// ------------------------------------------------------------------
+	// PT（2026-10-17 第二刀）：代理的"快失败"与"只覆盖建连阶段"的超时
+	//
+	// 治的是用户实测的"切到关机设备后白屏 15 秒"：页面第一个请求就是 `/dev/<id>/api/…`，
+	// 而对端关机时 Windows 的 TCP 建连要 15–21 秒才失败 ⇒ 壳一直不渲染。两条：
+	//  ① 账本里**刚判过不可达**（距今 < REACH_FRESH_MS）⇒ 一条上游连接都不发，直接 502
+	//     （upgrade 直接优雅 destroy），并顺手探一次这台设备；
+	//  ② 上游请求加一个**只覆盖建连阶段**的超时（缺省 3 秒）：socket 建好就清掉 ——
+	//     绝不能变成整请求超时（慢响应 / 长传输必须照常）。
+	// 这里给 `proxyConnectTimeoutMs` / `reachFreshMs` 两个 deps 钩子把窗口缩小，跑得快且不靠巧合。
+	// ------------------------------------------------------------------
+	section("PT 代理快失败 + 只覆盖建连阶段的超时（治「切到关机设备白屏 15 秒」）");
+
+	check("常量：建连超时缺省 3000ms；新鲜度窗口 = LIVE_POLL_MS 的 2 倍（≈4 秒）",
+		internals.PROXY_CONNECT_TIMEOUT_MS === 3000
+		&& internals.REACH_FRESH_MS === internals.LIVE_POLL_MS * 2
+		&& internals.REACH_FRESH_MS === 4000,
+		`connect=${String(internals.PROXY_CONNECT_TIMEOUT_MS)} fresh=${String(internals.REACH_FRESH_MS)} poll=${String(internals.LIVE_POLL_MS)}`);
+
+	/** 占一个空闲端口再放掉（用来制造"一开始没人听，后来有人听"的同一个地址）。 */
+	const freePort = async () => {
+		const server = createServer(() => {});
+		await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+		const port = server.address().port;
+		await new Promise((resolve) => server.close(resolve));
+		return port;
+	};
+	/** 一台会计数的上游（任何路径都回 200 JSON）：如果代理真的发了上游连接，这里就能看见。 */
+	const startCountingUpstream = async (port) => {
+		const requests = [];
+		const server = createServer((req, res) => {
+			requests.push({ method: req.method, url: req.url });
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+			res.end(JSON.stringify({ ok: true }));
+		});
+		await new Promise((resolve) => server.listen(port, "127.0.0.1", resolve));
+		return { requests, close: () => new Promise((resolve) => server.close(resolve)) };
+	};
+	/**
+	 * 只接受 TCP、**一个字节都不回**的哑上游（TLS 握手会一直挂着 ⇒ 测"建连挂起"）。
+	 * **必须是裸 net server**：用 node:http 的 createServer 会把 TLS ClientHello 当坏请求
+	 * 直接回 400/断开，那样测到的就不是"握手挂起"而是"立刻失败"。
+	 */
+	const startSilentTcp = async () => {
+		const sockets = [];
+		const server = netCreateServer((socket) => {
+			socket.on("error", () => { /* 对端主动断开不算错 */ });
+			sockets.push(socket);
+		});
+		await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+		return {
+			port: server.address().port,
+			sockets,
+			close: () => new Promise((resolve) => {
+				for (const socket of sockets) socket.destroy();
+				server.close(resolve);
+			}),
+		};
+	};
+	/** 连上之后**故意慢慢回**的上游（用来证明建连定时器已经清掉、不是整请求超时）。 */
+	const startSlowUpstream = async (delayMs) => {
+		const server = createServer((req, res) => {
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+			res.write('{"slow":');
+			setTimeout(() => { res.end("true}"); }, delayMs);
+		});
+		await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+		return { port: server.address().port, close: () => new Promise((resolve) => server.close(resolve)) };
+	};
+
+	const flakyPort = await freePort();
+	const stalePort = await freePort();
+	const slowUpstream = await startSlowUpstream(1000);
+	const silentTcp = await startSilentTcp();
+	const ptRouter = createRouter();
+	apply(ptRouter.ctx, {
+		dataFile: freshDataFile(),
+		current: "local",
+		devices: [
+			{ id: "flaky", name: "先关后开的台", url: `http://127.0.0.1:${flakyPort}` },
+			{ id: "stale", name: "结论过期的台", url: `http://127.0.0.1:${stalePort}` },
+			{ id: "slow", name: "慢响应台", url: `http://127.0.0.1:${slowUpstream.port}` },
+			{ id: "silent", name: "握手不回的台", url: `https://127.0.0.1:${silentTcp.port}` },
+		],
+		// 两个窗口都缩到"够快但留足余量"：2000ms 新鲜度让"标记落账 → 起计数上游 → 再发一次请求"
+		// 这段（毫秒级）绝不会因为慢机器漂出窗口；500ms 建连超时对面 1000ms 才回，余量 500ms。
+	}, { muxPath: "/api/remote.mux", proxyConnectTimeoutMs: 500, reachFreshMs: 2000 });
+	const ptHost = await startFakeHost(ptRouter);
+	const ptBase = `http://127.0.0.1:${ptHost.port}`;
+	/** 读设置页的 state 接口，等到账本把某台设备记成可达（最长等 1 秒）。 */
+	const waitReachable = async (id) => {
+		for (let attempt = 0; attempt < 40; attempt += 1) {
+			const snapshot = await httpJson(`${ptBase}${internals.PLUGIN_ROUTE}/state`);
+			const entry = (snapshot.json?.devices ?? []).find((device) => device.id === id);
+			if (entry?.reachable === true) return true;
+			await sleep(25);
+		}
+		return false;
+	};
+
+	// ① 账本里**没有**结论 ⇒ 照常去连（真的连不上 ⇒ 502，同时把这台记进账本）。
+	const flakyFirst = await httpGet(`${ptBase}/dev/flaky/api/x`);
+	check("账本里还没有结论 ⇒ 照常发起上游连接（连不上就 502，并把结论记进账本）",
+		flakyFirst.status === 502, `status=${String(flakyFirst.status)}`);
+	// 这台"活"过来了（同一个端口上起一台会计数的上游）。
+	const flakyUpstream = await startCountingUpstream(flakyPort);
+	// ② 账本**刚判过不可达**（200ms 窗口内）⇒ 一条上游连接都不发，直接 502 纯文本。
+	const fastFail = await httpGet(`${ptBase}/dev/flaky/api/x`);
+	await sleep(150); // 等"顺手探一次"那次探测落地
+	check("账本刚判过不可达 ⇒ **不发**这次请求的上游连接（对面收不到 /api/x），直接回 502",
+		fastFail.status === 502 && flakyUpstream.requests.every((request) => request.url !== "/api/x"),
+		`status=${String(fastFail.status)} 上游收到=${JSON.stringify(flakyUpstream.requests.map((request) => `${String(request.method)} ${String(request.url)}`))}`);
+	check("502 是纯文本中文说明（I1：不吐 HTML），且写明「不可达」",
+		String(fastFail.headers.get("content-type")).toLowerCase().startsWith("text/plain")
+		&& fastFail.body.includes("不可达") && !fastFail.body.includes("<"),
+		fastFail.body.replace(/\s+/gu, " ").slice(0, 100));
+	check("快失败顺手探了一次这台设备（对面收到探测的 `GET /`）—— 它一恢复马上可用",
+		flakyUpstream.requests.some((request) => request.method === "GET" && request.url === "/"),
+		JSON.stringify(flakyUpstream.requests.map((request) => `${String(request.method)} ${String(request.url)}`)));
+	check("探测已经把账本刷成可达（state 接口读得到）", await waitReachable("flaky"));
+	const flakyAfter = await httpGet(`${ptBase}/dev/flaky/api/x`);
+	check("账本刷新之后紧接着的请求**照常转发**（快失败不会把恢复了的设备继续拦着）",
+		flakyAfter.status === 200
+		&& flakyUpstream.requests.filter((request) => request.url === "/api/x").length === 1,
+		`status=${String(flakyAfter.status)} /api/x 次数=${String(flakyUpstream.requests.filter((request) => request.url === "/api/x").length)}`);
+
+	// ③ 账本结论**过期**（超过新鲜度窗口）⇒ 照常去连（绝不拿着过期结论拦路）。
+	const staleFirst = await httpGet(`${ptBase}/dev/stale/api/x`);
+	check("另一台先真连一次（连不上 ⇒ 502，账本记下 不可达）", staleFirst.status === 502, `status=${String(staleFirst.status)}`);
+	const staleUpstream = await startCountingUpstream(stalePort);
+	await sleep(2200); // > reachFreshMs（2000ms）
+	const staleSecond = await httpGet(`${ptBase}/dev/stale/api/x`);
+	check("账本结论已过期 ⇒ 照常发起上游连接（对面收到 /api/x，拿到 200）",
+		staleSecond.status === 200 && staleUpstream.requests.some((request) => request.url === "/api/x"),
+		`status=${String(staleSecond.status)} 上游收到=${JSON.stringify(staleUpstream.requests.map((request) => String(request.url)))}`);
+
+	// ④ **只覆盖建连阶段**：连上之后 1000ms 才回的上游，用 500ms 的建连超时也照样正常返回。
+	//    （如果那个定时器是"整请求超时"，这一条必红。）
+	const slowStarted = Date.now();
+	const slow = await httpGet(`${ptBase}/dev/slow/api/x`);
+	const slowMs = Date.now() - slowStarted;
+	check("连上之后的慢响应不受建连超时影响（500ms 建连超时 vs 对面 1000ms 才回 ⇒ 仍然 200）",
+		slow.status === 200 && slow.body.includes('"slow":true') && slowMs >= 950,
+		`status=${String(slow.status)} 耗时=${String(slowMs)}ms body=${JSON.stringify(slow.body.slice(0, 40))}`);
+
+	// ⑤ upgrade 那条路的建连超时：TCP 连上了但 TLS 握手不回 ⇒ 到点回 HTTP 502（不是挂死）。
+	// 502 里的中文说明是 UTF-8 字节（`rejectUpgrade` 按 utf8 写），所以这里按 utf8 解。
+	const silentUpgrade = await rawUpgradeProbe({ port: ptHost.port, path: "/dev/silent/api/remote.mux", timeoutMs: 4000 });
+	const silentUpgradeText = silentUpgrade.received.toString("utf8");
+	check("升级请求的建连阶段挂起（TCP 连上、TLS 握手不回）⇒ 到点收到 HTTP 502 纯文本（不是把连接挂死）",
+		silentUpgradeText.startsWith("HTTP/1.1 502 Bad Gateway")
+		// 认准"建连超时"那句：要真的是那条定时器到点了，而不是别的错误路径碰巧也回了 502。
+		&& silentUpgradeText.includes("建连超时")
+		&& silentUpgradeText.includes("text/plain"),
+		JSON.stringify(silentUpgradeText.slice(0, 120)));
+
+	// ⑥ **缺省**那个 3 秒（不缩小窗口）：TCP 连上但 TLS 握手不回 ⇒ 约 3 秒就 502（不是原来的 15 秒）。
+	const realSilent = await startSilentTcp();
+	const realRouter = createRouter();
+	apply(realRouter.ctx, {
+		dataFile: freshDataFile(),
+		current: "local",
+		devices: [{ id: "tls", name: "不回握手的台", url: `https://127.0.0.1:${realSilent.port}` }],
+	}, { muxPath: "/api/remote.mux" });
+	const realHost = await startFakeHost(realRouter);
+	const realStarted = Date.now();
+	const realTimeout = await httpGet(`http://127.0.0.1:${realHost.port}/dev/tls/api/x`);
+	const realMs = Date.now() - realStarted;
+	check("缺省（3 秒）真的生效：建连挂起 ⇒ 约 3 秒就 502（不是 CONNECT_TIMEOUT_MS 的 15 秒）",
+		realTimeout.status === 502 && realMs >= 2900 && realMs < 8000
+		&& realTimeout.body.includes("建连超时"),
+		`status=${String(realTimeout.status)} 耗时=${String(realMs)}ms body=${JSON.stringify(realTimeout.body.replace(/\s+/gu, " ").slice(0, 80))}`);
+	check("超时后账本记成不可达（下一次同机请求才有资格快失败）",
+		await (async () => {
+			const snapshot = await httpJson(`http://127.0.0.1:${realHost.port}${internals.PLUGIN_ROUTE}/state`);
+			const entry = (snapshot.json?.devices ?? []).find((device) => device.id === "tls");
+			return entry?.reachable === false;
+		})());
+
+	await realHost.close();
+	void realSilent.close();
+	await ptHost.close();
+	void flakyUpstream.close();
+	void staleUpstream.close();
+	void slowUpstream.close();
+	void silentTcp.close();
 
 	// ------------------------------------------------------------------
 	// C：I2
@@ -1578,9 +1897,15 @@ async function main() {
 	check("注入文本是自包含 IIFE（不引外部资源：无 http(s):// 引用、无 <link/script src>）",
 		injectedText.includes("(function remoteShim(") && !/https?:\/\//u.test(injectedText)
 		&& !/<link|<script/iu.test(injectedText));
-	check("注入文本含设备切换胶囊（元素 id / 「设备：」标签 / escapeHtml）",
-		injectedText.includes(`"${internals.SWITCHER_ELEMENT_ID}"`) && injectedText.includes("\"设备：\"")
-		&& injectedText.includes("function escapeHtml"));
+	// 0.12.0：胶囊那段死代码（`mount()` / `ELEMENT_ID` / `removePill()` / `escapeHtml` / 面板 DOM /
+	// 「设备：」文案）**整段删除**了 —— 所以这里改成**反向断言**：这些字面量一个都不许再出现在注入文本里。
+	// 覆盖没有降低：这正是"垫片不挂任何可见 UI"在**源码层面**的等价（更强的）口径。
+	check("注入文本里**没有**任何胶囊/面板死代码（mount / ELEMENT_ID / removePill / escapeHtml / 「设备：」/ data-device-id）",
+		!injectedText.includes("function mount") && !injectedText.includes("dsh-remote-root")
+		&& !injectedText.includes("removePill") && !injectedText.includes("function escapeHtml")
+		&& !injectedText.includes("\"设备：\"") && !injectedText.includes("data-device-id")
+		&& !injectedText.includes("dsh-remote-root-panel") && !injectedText.includes("dsh-remote-root-toggle"),
+		`mount=${String(injectedText.includes("function mount"))} root=${String(injectedText.includes("dsh-remote-root"))} removePill=${String(injectedText.includes("removePill"))} escapeHtml=${String(injectedText.includes("function escapeHtml"))} 设备：=${String(injectedText.includes("\"设备：\""))} data-device-id=${String(injectedText.includes("data-device-id"))}`);
 	check("注入文本含三处垫片（fetch / WebSocket / XMLHttpRequest）",
 		injectedText.includes("patchedFetch") && injectedText.includes("PatchedWebSocket") && injectedText.includes("patchedOpen"));
 	check("注入文本读的是约定好的 localStorage 键（主键 + 别名都读都写）",
@@ -1595,13 +1920,13 @@ async function main() {
 	check("自检只认 `enabled === false`（严格比较，不认 falsy / 缺字段）与 HTTP 404（插件已卸载）",
 		injectedText.includes("state.enabled === false") && injectedText.includes("state.enabled === true")
 		&& injectedText.includes("status === 404"));
-	check("自检的自除按下述顺序：清键 → 摘胶囊 → 还原原语 → 带哨兵刷新",
+	check("自检的自除按下述顺序：清键 → 停可达性探测 → 撤设备表 → 还原原语 → 带哨兵刷新",
 		(() => {
 			const body = injectedText.slice(injectedText.indexOf("function softOff"));
-			const order = ["clearStoredSelection", "removePill", "restorePrimitives", "reloadOnce"]
+			const order = ["clearStoredSelection", "healStop", "retractDeviceTable", "restorePrimitives", "reloadOnce"]
 				.map((name) => body.indexOf(`${name}()`));
 			return order.every((at) => at >= 0) && order.every((at, index) => index === 0 || order[index - 1] < at);
-		})(), injectedText.slice(injectedText.indexOf("function softOff"), injectedText.indexOf("function softOff") + 220).replace(/\s+/gu, " "));
+		})(), injectedText.slice(injectedText.indexOf("function softOff"), injectedText.indexOf("function softOff") + 260).replace(/\s+/gu, " "));
 	check("清键确有四个键（主键 + 别名：current/devices 都清）",
 		injectedText.includes("clearStoredSelection") && injectedText.includes("writeAll(KEYS_CURRENT, \"\")")
 		&& injectedText.includes("writeAll(KEYS_DEVICES, \"\")"));
@@ -1681,12 +2006,15 @@ async function main() {
 	runShim(realBox, injectedText);
 	check("真实注入文本在沙箱里可用：选中 self 后 fetch(\"api/sessions\") → \"/dev/self/api/sessions\"",
 		fetchTarget(realBox, "api/sessions") === "/dev/self/api/sessions", fetchTarget(realBox, "api/sessions"));
-	const realPanelHtml = realBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-panel`)?.innerHTML ?? "";
-	check("真实注入文本的设备表来自宿主数据文件（4 台设备 + 本机 = 5 项）",
-		(realPanelHtml.match(/data-device-id=/gu) ?? []).length === 5,
-		String((realPanelHtml.match(/data-device-id=/gu) ?? []).length));
-	check("真实注入文本里危险设备名经过转义（&lt;script&gt;alert(1)&lt;/script&gt;）",
-		realPanelHtml.includes("&lt;script&gt;alert(1)&lt;/script&gt;") && !realPanelHtml.includes("<script>alert(1)"));
+	check("真实注入文本**一点 UI 都不画**（右下角胶囊整段停用：容器 / 面板 / 胶囊都没有）",
+		noShimUi(realBox),
+		`container=${String(realBox.dom.findById(PILL_ELEMENT_ID) !== null)} panel=${String(realBox.dom.findById(`${PILL_ELEMENT_ID}-panel`) !== null)}`);
+	check("真实注入文本里的设备表照旧来自宿主数据文件（4 台设备 + 本机，只是不再画出来）",
+		["self", "ws", "real", "down"].every((id) => injectedText.includes(`"id":"${id}"`))
+		&& injectedText.includes('"localName"')
+		// `inlineJson` 把 `<` 转成 `\u003c`（防 `</script>` 提前闭合）；危险设备名照旧在 payload 里。
+		&& injectedText.includes("\\u003cscript>alert(1)\\u003c/script>"),
+		/"devices":\[[^\]]{0,120}/u.exec(injectedText)?.[0] ?? "(无)");
 	const realSockets = realBox.calls.sockets.length;
 	void new realBox.sandbox.WebSocket("ws://127.0.0.1:19387/api/remote.mux");
 	check("真实注入文本同样改写 WebSocket（路径改到 /dev/self/，host:port 不变）",
@@ -1697,7 +2025,7 @@ async function main() {
 	// ------------------------------------------------------------------
 	// D：垫片单测
 	// ------------------------------------------------------------------
-	section("D1 未选中设备：垫片完全不 patch（fetch/WebSocket/XHR 保持原函数），但仍然挂出胶囊");
+	section("D1 未选中设备：垫片完全不 patch（fetch/WebSocket/XHR 保持原函数），也不挂任何 UI（胶囊已停用）");
 	const idleBox = createShimSandbox({ transport: { ownsHost: true, streamBaseUrl: "http://127.0.0.1:19387" } });
 	runShim(idleBox, SHIM_TEXT);
 	check("未选中时不包装 fetch（同一个函数引用）", idleBox.sandbox.fetch === idleBox.originalFetch);
@@ -1705,13 +2033,11 @@ async function main() {
 	check("未选中时不包装 XMLHttpRequest.open",
 		idleBox.sandbox.XMLHttpRequest.prototype.open === idleBox.originalXhr.prototype.open);
 	check("未选中时 fetch 原样透传（不做任何改写）", fetchTarget(idleBox, "api/sessions") === "api/sessions");
-	check("未选中时也挂出胶囊（本机模式下还能切回去）", idleBox.dom.findById(internals.SWITCHER_ELEMENT_ID) !== null);
-	const idleToggle = idleBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-toggle`);
-	check("胶囊上能看出当前是本机", idleToggle?.textContent === "设备：本机", idleToggle?.textContent);
-	const idlePanel = idleBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-panel`);
-	check("面板列出所有设备 + 本机（3 项）",
-		(idlePanel?.innerHTML.match(/data-device-id=/gu) ?? []).length === 3,
-		String((idlePanel?.innerHTML.match(/data-device-id=/gu) ?? []).length));
+	check("未选中时也不挂任何可见 UI（垫片不画 UI；切设备入口在侧栏那一行 + 浮层）", noShimUi(idleBox));
+	const idleToggle = idleBox.dom.findById(`${PILL_ELEMENT_ID}-toggle`);
+	check("历史胶囊的节点**根本不存在**（死代码已删，连落点都没有）", idleToggle === null, String(idleToggle));
+	const idlePanel = idleBox.dom.findById(`${PILL_ELEMENT_ID}-panel`);
+	check("面板节点也不存在（死代码已删：不建面板、不渲染设备表）", idlePanel === null, String(idlePanel));
 	check("垫片加载后报到了（调用了一次未包装的 fetch POST /plugin/remote/hello）",
 		idleBox.calls.fetch.some((call) => call.input === internals.HELLO_PATH && call.init?.method === "POST"),
 		JSON.stringify(idleBox.calls.fetch.map((call) => call.input)));
@@ -1774,11 +2100,12 @@ async function main() {
 	check("XMLHttpRequest.open 保留后面的 async/user/password 参数",
 		box.calls.xhr.at(-1)?.url === "/dev/home/api/z" && box.calls.xhr.at(-1)?.method === "POST",
 		`${String(box.calls.xhr.at(-1)?.method)} ${String(box.calls.xhr.at(-1)?.url)}`);
-	check("胶囊标签显示当前设备（设备：设备B）",
-		box.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-toggle`)?.textContent === "设备：设备B",
-		box.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-toggle`)?.textContent);
-	check("面板把当前设备标成 current",
-		(box.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-panel`)?.innerHTML ?? "").includes('data-current="1"'));
+	check("选中设备时也不挂任何可见 UI，但改写照样按 selected 走（不画 UI ≠ 不切设备）",
+		box.dom.findById(`${PILL_ELEMENT_ID}-toggle`) === null
+		&& fetchTarget(box, "api/sessions") === "/dev/home/api/sessions",
+		`toggle=${String(box.dom.findById(`${PILL_ELEMENT_ID}-toggle`))} target=${fetchTarget(box, "api/sessions")}`);
+	check("选中设备时面板节点同样不存在（死代码已删：不建面板、没有 data-current 可看）",
+		box.dom.findById(`${PILL_ELEMENT_ID}-panel`) === null && noShimUi(box));
 
 	section("D3 幂等：同一份脚本执行两次不叠加包装");
 	const fetchAfterFirst = box.sandbox.fetch;
@@ -1794,8 +2121,8 @@ async function main() {
 	check("二次执行后改写结果不叠加（不会变成 /dev/home/dev/home/…）", twiceTarget === "/dev/home/api/sessions", twiceTarget);
 	check("一次调用只落到原始 fetch 一次", box.calls.fetch.length === callsBefore + 1,
 		`${String(callsBefore)} → ${String(box.calls.fetch.length)}`);
-	check("胶囊没有出现第二个（DOM id 幂等）",
-		box.dom.body.children.filter((node) => node.id === internals.SWITCHER_ELEMENT_ID).length === 1);
+	check("胶囊没被挂出来（DOM id 幂等：两次执行后 shim 节点数仍为 0）",
+		box.dom.body.children.filter((node) => node.id === PILL_ELEMENT_ID).length === 0 && noShimUi(box));
 
 	section("D4 桌面形态：文档是 dsh-app://app/，流地址是本机 origin");
 	const desktopReloads = { count: 0 };
@@ -1831,40 +2158,38 @@ async function main() {
 		desktopBox.sandbox.__DSH_TRANSPORT__?.streamBaseUrl === "http://127.0.0.1:19387"
 		&& desktopBox.sandbox.__DSH_TRANSPORT__.ownsHost === true);
 
-	section("D5 切换动作：点「本机」写 localStorage 并 location.reload()");
+	section("D5 切换动作：胶囊 UI 停用 ⇒ 不再有可点的设备项（切设备入口交给侧栏那一行 + 浮层）");
 	const switchBox = createShimSandbox({
 		current: "home",
 		devices: [{ id: "home", name: "设备B" }, { id: "company", name: "<script>alert(1)</script>" }],
 	});
-	runShim(switchBox, internals.renderShimScript({
+	const switchText = internals.renderShimScript({
 		devices: [{ id: "home", name: "设备B" }, { id: "company", name: "<script>alert(1)</script>" }],
 		localName: "本机",
-	}));
-	const switchPanel = switchBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-panel`);
-	check("危险设备名被转义（面板里出现 &lt;script&gt;alert(1)&lt;/script&gt;）",
-		(switchPanel?.innerHTML ?? "").includes("&lt;script&gt;alert(1)&lt;/script&gt;"),
-		(switchPanel?.innerHTML ?? "").includes("&lt;script&gt;") ? "已转义" : "未转义");
-	check("危险设备名没有被原样写进 innerHTML", !(switchPanel?.innerHTML ?? "").includes("<script>alert(1)"));
-	const clickEvent = { preventDefault() {}, stopPropagation() {} };
-	switchPanel?.dispatch("click", {
-		...clickEvent,
-		target: { closest: () => ({ getAttribute: () => "company" }) },
 	});
-	check("点设备项：localStorage 写入该设备 id",
-		switchBox.storage.get(internals.STORAGE_KEYS.current) === "company",
+	runShim(switchBox, switchText);
+	const switchPanel = switchBox.dom.findById(`${PILL_ELEMENT_ID}-panel`);
+	check("胶囊那段代码**已整段删除**（注入文本里既没有 mount / escapeHtml，也没有「设备：」文案与 data-device-id）",
+		switchPanel === null && !switchText.includes("function mount") && !switchText.includes("function escapeHtml")
+		&& !switchText.includes("\"设备：\"") && !switchText.includes("data-device-id")
+		&& !switchText.includes("dsh-remote-root"),
+		`panel=${String(switchPanel)} mount=${String(switchText.includes("function mount"))} escapeHtml=${String(switchText.includes("function escapeHtml"))} root=${String(switchText.includes("dsh-remote-root"))}`);
+	check("危险设备名没有被原样写进 DOM（面板整段停用 ⇒ 连落点都没有）",
+		noShimUi(switchBox) && !String(switchBox.dom.body.innerHTML ?? "").includes("<script>alert(1)"),
+		`shimUi=${String(!noShimUi(switchBox))}`);
+	check("停用后垫片不再改写 localStorage 的 current（还是打开页面时那个 home）",
+		switchBox.storage.get(internals.STORAGE_KEYS.current) === "home",
 		String(switchBox.storage.get(internals.STORAGE_KEYS.current)));
-	check("点设备项：别名键也一起写上（客户端半用哪个键都能读）",
-		switchBox.storage.get(internals.STORAGE_KEYS.currentAlias) === "company",
+	check("别名键也不会被凭空写上（垫片只在自除清键时才动它）",
+		switchBox.storage.has(internals.STORAGE_KEYS.currentAlias) === false,
 		String(switchBox.storage.get(internals.STORAGE_KEYS.currentAlias)));
-	check("点设备项：触发 location.reload()", switchBox.calls.reloads === 1, String(switchBox.calls.reloads));
+	check("停用后不会自己刷新页面", switchBox.calls.reloads === 0, String(switchBox.calls.reloads));
 	const idlePanelBox = createShimSandbox({ current: "home", devices: [{ id: "home", name: "设备B" }] });
 	runShim(idlePanelBox, SHIM_TEXT);
-	idlePanelBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-panel`)?.dispatch("click", {
-		...clickEvent,
-		target: { closest: () => ({ getAttribute: () => "" }) },
-	});
-	check("点「本机」：清掉 selected（回本机）并 reload",
-		idlePanelBox.storage.has(internals.STORAGE_KEYS.current) === false && idlePanelBox.calls.reloads === 1,
+	check("停用后连「点面板里的本机项」这条路径都不存在了（没有面板可点、键不变、也不 reload）",
+		idlePanelBox.dom.findById(`${PILL_ELEMENT_ID}-panel`) === null
+		&& idlePanelBox.calls.reloads === 0
+		&& idlePanelBox.storage.get(internals.STORAGE_KEYS.current) === "home",
 		`has=${String(idlePanelBox.storage.has(internals.STORAGE_KEYS.current))} reloads=${String(idlePanelBox.calls.reloads)}`);
 
 	section("D6 垫片只在 localStorage 说明有设备时才动网络；devices 键可覆盖内置缺省");
@@ -1874,14 +2199,14 @@ async function main() {
 		transport: { ownsHost: true, streamBaseUrl: "http://127.0.0.1:19387" },
 	});
 	runShim(localBox, SHIM_TEXT);
-	check("localStorage 的 devices 覆盖了注入的内置列表（面板里是覆盖后的名字）",
-		(localBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-panel`)?.innerHTML ?? "").includes("覆盖后的名字"));
-	check("选中的 id 不在列表里时也会出现在面板里（配置改过仍能切回来）",
+	check("devices 键照旧被读到（读到也不画了）：改写不受影响、UI 一个都不挂",
+		fetchTarget(localBox, "api/sessions") === "/dev/home/api/sessions" && noShimUi(localBox),
+		fetchTarget(localBox, "api/sessions"));
+	check("选中的 id 不在列表里时（ghost）**照旧**改写到 /dev/ghost/（只是不再出现在任何面板里）",
 		(() => {
 			const strayBox = createShimSandbox({ current: "ghost" });
 			runShim(strayBox, SHIM_TEXT);
-			const html = strayBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-panel`)?.innerHTML ?? "";
-			return html.includes('data-device-id="ghost"') && html.includes("本机");
+			return fetchTarget(strayBox, "api/sessions") === "/dev/ghost/api/sessions" && noShimUi(strayBox);
 		})());
 
 	// ------------------------------------------------------------------
@@ -1902,7 +2227,16 @@ async function main() {
 	const idleFile = freshDataFile();
 	apply(idleRouter.ctx, { dataFile: idleFile }, { muxPath: "/api/remote.mux" });
 	check("没有注册任何 /dev/** 路由", idleRouter.devPrefixes().length === 0 && idleRouter.upgrades.size === 0);
-	check("只注册了设置页那一条 prefix 路由", idleRouter.prefixes.size === 1 && idleRouter.prefixes.has(internals.PLUGIN_ROUTE));
+	// 跨机实时状态这一刀多注册了**一条**跨机取数口 `/dsh-remote-live`、0.12.0 又加了一条浏览器口
+	// `/dsh-remote-view`（两条都**故意不带 /plugin/ 前缀**，否则会被对端 edge 的
+	// EDGE_BLOCKED_PREFIXES=["/plugin/"] 403 掉；见宿主半「跨机实时状态」region）。
+	// 所以这里断言"正好这三条、且就是这三条"，仍然挡住任何乱注册。
+	check("只注册了设置页 + 跨机取数口 + 浏览器口那三条 prefix 路由",
+		idleRouter.prefixes.size === 3
+		&& idleRouter.prefixes.has(internals.PLUGIN_ROUTE)
+		&& idleRouter.prefixes.has(internals.PEER_LIVE_ROOT)
+		&& idleRouter.prefixes.has(internals.VIEW_PATH),
+		[...idleRouter.prefixes.keys()].join(","));
 	check("没有种子数据时不会凭空创建数据文件（不写 $DSH_HOME）", existsSync(idleFile) === false, idleFile);
 	check("仍然注入垫片（无设备时它在页面上不 patch、不加 UI）",
 		idleRouter.taps.length === 1 && idleRouter.effects.some((effect) => effect.label.includes("lifetime")));
@@ -1911,7 +2245,7 @@ async function main() {
 	check("空配置 + 未选中：不 patch、不加 UI（完全惰性）",
 		emptyBox.sandbox.fetch === emptyBox.originalFetch
 		&& emptyBox.sandbox.WebSocket === emptyBox.originalWebSocket
-		&& emptyBox.dom.findById(internals.SWITCHER_ELEMENT_ID) === null);
+		&& emptyBox.dom.findById(PILL_ELEMENT_ID) === null);
 	const idleHost = await startFakeHost(idleRouter);
 	const idleGet = await httpGet(`http://127.0.0.1:${idleHost.port}/dev/anything/`);
 	check("/dev/anything/ 落到 fallback（404），插件不拦", idleGet.status === 404, `status=${idleGet.status}`);
@@ -1942,7 +2276,7 @@ async function main() {
 		offBox.sandbox.fetch === offBox.originalFetch
 		&& offBox.sandbox.WebSocket === offBox.originalWebSocket
 		&& offBox.sandbox.XMLHttpRequest.prototype.open === offBox.originalXhr.prototype.open);
-	check("注入时 enabled:false → 也不挂胶囊", offBox.dom.findById(internals.SWITCHER_ELEMENT_ID) === null);
+	check("注入时 enabled:false → 也不挂胶囊", offBox.dom.findById(PILL_ELEMENT_ID) === null);
 	check("注入时 enabled:false → 仍然问一次 /state（老窗口靠它自除）",
 		offBox.calls.fetch.some((call) => call.input === internals.STATE_PATH && call.init?.method === "GET"));
 
@@ -1955,13 +2289,14 @@ async function main() {
 		stateBody: { enabled: false },
 	});
 	runShim(staleBox, SHIM_TEXT);
-	check("前置条件：老窗口的垫片确实同步 patch 了 fetch 并挂出了胶囊",
-		staleBox.sandbox.fetch !== staleBox.originalFetch
-		&& staleBox.dom.findById(internals.SWITCHER_ELEMENT_ID) !== null);
-	const stalePill = staleBox.dom.findById(internals.SWITCHER_ELEMENT_ID);
+	check("前置条件：老窗口的垫片确实同步 patch 了 fetch（胶囊代码已整段删除 ⇒ 本来就没有任何 UI 可挂）",
+		staleBox.sandbox.fetch !== staleBox.originalFetch && noShimUi(staleBox));
+	const stalePill = staleBox.dom.findById(PILL_ELEMENT_ID);
 	const stalePillIndexBefore = staleBox.dom.body.children.indexOf(stalePill);
+	const staleBodyBefore = staleBox.dom.body.children.length;
 	await sleep(0);
-	check("自检拿到 enabled:false → 胶囊被摘掉", staleBox.dom.findById(internals.SWITCHER_ELEMENT_ID) === null);
+	check("自检拿到 enabled:false → 本来就没有 UI，自除后依然没有（干净）",
+		staleBox.dom.findById(PILL_ELEMENT_ID) === null && noShimUi(staleBox));
 	check("自检拿到 enabled:false → 被改写的三个原语都还原了",
 		staleBox.sandbox.fetch === staleBox.originalFetch
 		&& staleBox.sandbox.WebSocket === staleBox.originalWebSocket
@@ -1974,8 +2309,11 @@ async function main() {
 	check("自检拿到 enabled:false → 带哨兵刷新了页面一次（哨兵写进 sessionStorage）",
 		staleBox.calls.reloads === 1 && staleBox.storage.get(internals.SHIM_SELFTEST_SENTINEL_KEY) === "1",
 		`reloads=${String(staleBox.calls.reloads)} sentinel=${String(staleBox.storage.get(internals.SHIM_SELFTEST_SENTINEL_KEY))}`);
-	check("摘胶囊是 removeChild（真的从 DOM 上摘掉了，不是只藏起来）",
-		stalePillIndexBefore >= 0 && staleBox.dom.body.children.includes(stalePill) === false);
+	// 0.12.0：`removePill()` 已随死代码整段删除 ⇒ 这条改成"自除**不插任何节点**"的等价（更强的）断言：
+	// body 一个子节点都没多、那个 id 也从来不存在（`removePill` 的活现在是"根本没人挂"）。
+	check("自除对「本来就没有 UI」的窗口是空操作（幂等、不报错、DOM 一个节点都没多）",
+		stalePill === null && stalePillIndexBefore === -1 && staleBox.dom.body.children.length === staleBodyBefore
+		&& noShimUi(staleBox));
 
 	// ③ 哨兵在位 = 这个窗口已经为"停用"刷过一次 → 同步阶段直接当没装，且不再刷第二次。
 	const sentinelBox = createShimSandbox({
@@ -1988,7 +2326,7 @@ async function main() {
 	check("哨兵在位 → 同步阶段就当没装：不 patch、不挂胶囊、不刷新",
 		sentinelBox.sandbox.fetch === sentinelBox.originalFetch
 		&& sentinelBox.sandbox.WebSocket === sentinelBox.originalWebSocket
-		&& sentinelBox.dom.findById(internals.SWITCHER_ELEMENT_ID) === null
+		&& sentinelBox.dom.findById(PILL_ELEMENT_ID) === null
 		&& sentinelBox.calls.reloads === 0);
 	await sleep(0);
 	check("哨兵在位 + 自检又拿到 enabled:false → 绝不刷新第二次（防循环）",
@@ -2004,7 +2342,7 @@ async function main() {
 	await sleep(0);
 	check("404 = 插件已被卸载 → 一样自除（清键 + 摘胶囊 + 还原 + 刷新一次）",
 		goneBox.storage.has(internals.STORAGE_KEYS.current) === false
-		&& goneBox.dom.findById(internals.SWITCHER_ELEMENT_ID) === null
+		&& goneBox.dom.findById(PILL_ELEMENT_ID) === null
 		&& goneBox.sandbox.fetch === goneBox.originalFetch
 		&& goneBox.calls.reloads === 1,
 		`reloads=${String(goneBox.calls.reloads)}`);
@@ -2021,7 +2359,7 @@ async function main() {
 	check("前置条件：哨兵在位时同步阶段不 patch、不挂胶囊（= 错过挂载时机，胶囊得靠下一次加载）",
 		healBox.sandbox.fetch === healBox.originalFetch
 		&& healBox.sandbox.WebSocket === healBox.originalWebSocket
-		&& healBox.dom.findById(internals.SWITCHER_ELEMENT_ID) === null);
+		&& healBox.dom.findById(PILL_ELEMENT_ID) === null);
 	await sleep(0);
 	check("惰性自愈：live enabled:true 且本次惰性 → 置 force-active 并刷新一次",
 		healBox.storage.get(internals.SHIM_FORCE_ACTIVE_KEY) === "1" && healBox.calls.reloads === 1,
@@ -2043,9 +2381,9 @@ async function main() {
 		if (value !== undefined) afterHealBox.storage.set(key, value);
 	}
 	runShim(afterHealBox, SHIM_TEXT);
-	check("自愈后的下一次加载：force-active 让哨兵失效 → 同步 patch + 挂胶囊，且不再刷新",
+	check("自愈后的下一次加载：force-active 让哨兵失效 → 同步 patch 生效（胶囊 UI 停用 ⇒ 不再挂）且不再刷新",
 		afterHealBox.sandbox.fetch !== afterHealBox.originalFetch
-		&& afterHealBox.dom.findById(internals.SWITCHER_ELEMENT_ID) !== null
+		&& noShimUi(afterHealBox)
 		&& afterHealBox.calls.reloads === 0,
 		`reloads=${String(afterHealBox.calls.reloads)}`);
 	check("force-active 用掉即删（只强制激活一次，不留残留）",
@@ -2072,7 +2410,7 @@ async function main() {
 		sentinelKey: internals.SHIM_SELFTEST_SENTINEL_KEY,
 		forceActiveKey: internals.SHIM_FORCE_ACTIVE_KEY,
 	}));
-	check("force-active 存在 → 忽略 payload.enabled:false 与哨兵：patch + 挂胶囊 + 删标记",
+	check("force-active 存在 → 忽略 payload.enabled:false 与哨兵：patch 生效 + 不挂 UI（停用）+ 删标记",
 		forcedBox.sandbox.fetch !== forcedBox.originalFetch
 		&& forcedBox.sandbox.WebSocket !== forcedBox.originalWebSocket
 		// XHR 的原语是**同一个 prototype**，比对象引用恒为真；这里按行为断言（open 真的被改写）。
@@ -2081,9 +2419,9 @@ async function main() {
 			probe.open("GET", "api/sessions");
 			return forcedBox.calls.xhr.at(-1)?.url === "/dev/home/api/sessions";
 		})()
-		&& forcedBox.dom.findById(internals.SWITCHER_ELEMENT_ID) !== null
+		&& noShimUi(forcedBox)
 		&& forcedBox.storage.has(internals.SHIM_FORCE_ACTIVE_KEY) === false,
-		`fetch=${String(forcedBox.sandbox.fetch !== forcedBox.originalFetch)} ws=${String(forcedBox.sandbox.WebSocket !== forcedBox.originalWebSocket)} xhr=${String(forcedBox.calls.xhr.at(-1)?.url)} pill=${String(forcedBox.dom.findById(internals.SWITCHER_ELEMENT_ID) !== null)} marker=${String(forcedBox.storage.get(internals.SHIM_FORCE_ACTIVE_KEY))}`);
+		`fetch=${String(forcedBox.sandbox.fetch !== forcedBox.originalFetch)} ws=${String(forcedBox.sandbox.WebSocket !== forcedBox.originalWebSocket)} xhr=${String(forcedBox.calls.xhr.at(-1)?.url)} shimUi=${String(!noShimUi(forcedBox))} marker=${String(forcedBox.storage.get(internals.SHIM_FORCE_ACTIVE_KEY))}`);
 	await sleep(0);
 	check("强制激活落地后 live enabled:true → 不刷新，只把哨兵清掉",
 		forcedBox.calls.reloads === 0 && forcedBox.storage.has(internals.SHIM_SELFTEST_SENTINEL_KEY) === false,
@@ -2103,7 +2441,7 @@ async function main() {
 	runShim(noMarkerBox, SHIM_TEXT);
 	await sleep(0);
 	check("惰性自愈写不进 force-active → 绝不刷新（降级为手动重载，避免每次加载都刷成死循环）",
-		noMarkerBox.calls.reloads === 0 && noMarkerBox.dom.findById(internals.SWITCHER_ELEMENT_ID) === null,
+		noMarkerBox.calls.reloads === 0 && noMarkerBox.dom.findById(PILL_ELEMENT_ID) === null,
 		`reloads=${String(noMarkerBox.calls.reloads)}`);
 
 	// ⑨ enabled:true 的正常窗口（不惰性）与"探测失败"都必须安静。
@@ -2126,11 +2464,367 @@ async function main() {
 	delete brokenProbeBox.sandbox.sessionStorage;
 	runShim(brokenProbeBox, SHIM_TEXT);
 	await sleep(0);
-	check("自检请求被拒（网络失败）→ 安静：不清键、不摘胶囊、不刷新",
+	check("自检请求被拒（网络失败）→ 安静：不清键、不刷新（胶囊 UI 停用 ⇒ 也没有胶囊可摘）",
 		brokenProbeBox.storage.get(internals.STORAGE_KEYS.current) === "home"
-		&& brokenProbeBox.dom.findById(internals.SWITCHER_ELEMENT_ID) !== null
+		&& noShimUi(brokenProbeBox)
 		&& brokenProbeBox.calls.reloads === 0,
 		`reloads=${String(brokenProbeBox.calls.reloads)}`);
+
+	// ------------------------------------------------------------------
+	// K1（2026-10-17）：自愈（那个致死缺陷的补丁）
+	//
+	// 背景：那台机器关机时切过去 ⇒ 所有 `/api` 被改写成 `/dev/<那台>/api/…` ⇒ 全部失败 ⇒
+	// App 壳渲染不出来 ⇒ 切设备的入口（长在 App DOM 里）一个都点不到，用户只能等那台开机。
+	// 修法：**只留同步判据** —— 选中的 id 不在本机配置的设备表里（脏 id / 从别的机器带过来的键）
+	// 就清键 + 刷一次回本机（防回环 + 说不清就不动）。
+	//
+	// 2026-10-17 第二刀按用户要求**删掉了**上一刀那条"基于可达性的自动重置"：
+	// `/plugin/remote/live` 探针 + `reachable === false` 连续 2 次 ⇒ 自动回本机（他不要
+	// "我自己切过去又被你弹回来"）。所以本段的用例从 9 条减到 4 条，并且多了一条
+	// "垫片从此不再打任何探测请求"的回归断言。
+	// ------------------------------------------------------------------
+	section("K1 自愈①：同步判据（选中的 id 不在本机设备表 ⇒ 清键 + 刷一次）；可达性探测只在非回环会话里开");
+
+	check("自愈的判据键名与垫片函数体里的局部字面量逐字一致（垫片引用不了模块绑定，只能靠断言钉住）",
+		SHIM_TEXT.includes('var AUTO_RESET_KEY = "dsh-remote:auto-reset";')
+		&& SHIM_TEXT.includes('var AUTO_RESET_COOLDOWN_MS = 60000;'),
+		`autoResetKey=${String(SHIM_TEXT.includes('var AUTO_RESET_KEY = "dsh-remote:auto-reset";'))}`);
+
+	// ① 同步判据：选中的 id 不在本机配置的设备表里 ⇒ 立刻清键 + 刷一次。
+	const ghostBox = bootShimWithClock({
+		current: "ghost",
+		devices: [{ id: "home", name: "家里台" }],
+		deviceSeed: [{ id: "home", name: "家里台" }],
+	});
+	check("选中的 id 不在设备表里 ⇒ 两个 current 键都被清掉",
+		ghostBox.storage.get(internals.STORAGE_KEYS.current) === undefined
+		&& ghostBox.storage.has(internals.STORAGE_KEYS.currentAlias) === false,
+		`main=${String(ghostBox.storage.get(internals.STORAGE_KEYS.current))} alias=${String(ghostBox.storage.has(internals.STORAGE_KEYS.currentAlias))}`);
+	check("选中的 id 不在设备表里 ⇒ **只**刷新一次（哨兵保证不自己刷成环）+ 标记落下",
+		ghostBox.calls.reloads === 1 && ghostBox.slot.checks().selfHealRan === true,
+		`reloads=${String(ghostBox.calls.reloads)} selfHealRan=${String(ghostBox.slot.checks().selfHealRan)}`);
+
+	// ② 配置表为空（一台设备都没配）⇒ 没有"这个 id 是脏的"的依据 ⇒ 不动。
+	const noTableBox = bootShimWithClock({ current: "ghost", devices: [] });
+	check("设备表为空时选中的 id 也照旧不动（没有依据就不动；老用例 D6 的 ghost 分支仍是原行为）",
+		noTableBox.calls.reloads === 0 && noTableBox.storage.get(internals.STORAGE_KEYS.current) === "ghost"
+		&& noTableBox.slot.checks().selfHealRan === false,
+		`reloads=${String(noTableBox.calls.reloads)}`);
+
+	// ③ 选中为空（本机）⇒ 这条补丁一个字节都不许碰，而且**一个探测请求都不打**。
+	const localBox2 = bootShimWithClock({ current: "" });
+	check("选中为空（本机）⇒ 不自愈、不清键、不刷新（键保持空串 = 本机态）",
+		localBox2.calls.reloads === 0
+		&& String(localBox2.storage.get(internals.STORAGE_KEYS.current) ?? "") === ""
+		&& localBox2.slot.checks().selfHealRan === false,
+		`reloads=${String(localBox2.calls.reloads)}`);
+
+	// ④ 垫片**只在非回环会话**里才登记那条可达性探测（见 K4）。**回环会话**（127.0.0.1 / localhost /
+	//    ::1，桌面壳与"本机浏览器"就是这类）里：`/plugin/remote/live` 与 `/dsh-remote-view` **一条都不打**、
+	//    一个定时器都不登记；垫片也**不插任何 DOM**（胶囊面板 / 左上角按钮都已整段删除）。
+	const noProbeBox = bootShimWithClock({ current: "home" });
+	check("回环会话：垫片**从不**请求 /plugin/remote/live 与 /dsh-remote-view（对端态也一样）、一个定时器都不登记、也不插任何 DOM",
+		noProbeBox.calls.fetch.every((call) => call.input !== internals.LIVE_PATH && call.input !== internals.VIEW_PATH)
+		&& noProbeBox.slot.checks().timers.length === 0
+		&& noProbeBox.dom.body.children.length === 0
+		&& !SHIM_TEXT.includes("schedule("),
+		`fetch=${JSON.stringify(noProbeBox.calls.fetch.map((call) => call.input))} timers=${JSON.stringify(noProbeBox.slot.checks().timers)} bodyChildren=${String(noProbeBox.dom.body.children.length)}`);
+
+	// ⑤ 防回环的第二道：冷却标记写不进去（localStorage 被禁）⇒ **绝不重置**。
+	// 注意顺序：`setItem` 必须在**跑垫片之前**就换成抛异常的版本（`bootShimWithClock` 内部跑垫片）。
+	const noMarkBox = withShimClock(createShimSandbox({ current: "ghost" }));
+	noMarkBox.sandbox.localStorage.setItem = function deniedSetItem() {
+		throw new Error("localStorage denied");
+	};
+	runShim(noMarkBox, internals.renderShimScript({ devices: [{ id: "home", name: "家里台" }], localName: "本机" }));
+	check("冷却标记写不进 localStorage ⇒ 宁可不救也不重置（否则就是「刷新 → 又重置」的死循环）",
+		noMarkBox.calls.reloads === 0 && noMarkBox.storage.get(internals.STORAGE_KEYS.current) === "ghost",
+		`reloads=${String(noMarkBox.calls.reloads)}`);
+
+	// ⑥ 防回环的第三道：冷却窗口内不重复 reset（标记刚写过）。
+	const cookedBox = withShimClock(createShimSandbox({ current: "ghost" }));
+	cookedBox.storage.set("dsh-remote:auto-reset", JSON.stringify({ at: 0, count: 1 }));
+	runShim(cookedBox, internals.renderShimScript({ devices: [{ id: "home", name: "家里台" }], localName: "本机" }));
+	check("60 秒冷却窗口内（标记刚写过）⇒ 不重复 reset（防回环）",
+		cookedBox.calls.reloads === 0 && cookedBox.storage.get(internals.STORAGE_KEYS.current) === "ghost",
+		`reloads=${String(cookedBox.calls.reloads)}`);
+
+	// ------------------------------------------------------------------
+	// K4（0.12.0）：**可达性自愈**——只给"没有别的出口"的会话（非回环 + http(s)）
+	//
+	// 背景：手机 / 浏览器经「对外端口」（edge）打开本机页面时，切设备入口（客户端半那一行 + 浮层）
+	// 长在 App 的 DOM 里，而对端关机时页面所有 `/api` 都被改写成 `/dev/<那台>/…` ⇒ 壳渲染不出来
+	// ⇒ 用户一个入口都没有（垫片是唯一不依赖 App DOM 的出路）。所以恢复"连续 2 次不可达 ⇒ 回本机"，
+	// 但**只在非回环会话**里（桌面壳 `dsh-app://app/` 与 127.0.0.1 一律不动手：用户明确不要
+	// "我自己切过去又被你弹回来"）。取数走 `/dsh-remote-view`（非 `/plugin/` ⇒ 能穿过 edge）。
+	// 本组用例盯：非回环 2 次 ⇒ 清键 + 刷新一次；回环 / 桌面壳 ⇒ 一个定时器都不登记、一条都不打；
+	// 未知（没数据 / 403）与"抖动"⇒ 计数清零、绝不重置；以及垫片本地的路径/间隔字面量。
+	// ------------------------------------------------------------------
+	section("K4 可达性自愈（0.12.0）：非回环会话连续 2 次不可达 ⇒ 清键 + 刷回本机；回环 / 桌面壳 / 未知一律不动");
+
+	/** 非回环（域名）的 location：`http://nas.example.com/`（手机 / 浏览器经 edge 的样子）。 */
+	const browserLocation = (hostname) => ({
+		href: `http://${hostname}/`,
+		host: hostname,
+		hostname,
+		protocol: "http:",
+		pathname: "/",
+		reload() {},
+	});
+	const unreachablePeers = (id) => [{ id, name: "家里台", reachable: false, lastError: "连接超时", live: null }];
+	const currentKeysGone = (box) => box.storage.has(internals.STORAGE_KEYS.current) === false
+		&& box.storage.has(internals.STORAGE_KEYS.currentAlias) === false;
+
+	check("垫片本地的聚合口字面量与模块常量 VIEW_PATH 逐字一致（垫片引用不了模块绑定，只能靠断言钉住）",
+		SHIM_TEXT.includes('var HEAL_VIEW_PATH = "/dsh-remote-view";') && internals.VIEW_PATH === "/dsh-remote-view",
+		String(internals.VIEW_PATH));
+	check("探测间隔与「连续几次」也都是钉死的常量（2 秒那一套 / 2 次）",
+		SHIM_TEXT.includes("var HEAL_POLL_MS = 2000;") && SHIM_TEXT.includes("var HEAL_FAILS_TO_RESET = 2;"));
+
+	// ① 非回环：第 1 次不可达不动手，第 2 次才清键 + 刷新一次。
+	const upView = { peers: unreachablePeers("home") };
+	const reachBox = bootShimWithClock({
+		current: "home",
+		devices: [{ id: "home", name: "家里台" }],
+		deviceSeed: [{ id: "home", name: "家里台" }],
+		location: browserLocation("nas.example.com"),
+		viewState: upView,
+	});
+	check("非回环会话：登记了一条探测（2 秒），并且立刻探了第 1 次",
+		reachBox.slot.checks().timers.length === 1
+		&& reachBox.calls.fetch.some((call) => call.input === internals.VIEW_PATH),
+		`timers=${JSON.stringify(reachBox.slot.checks().timers)} fetch=${JSON.stringify(reachBox.calls.fetch.map((call) => call.input))}`);
+	check("探测打的是 /dsh-remote-view（非 /plugin/ 前缀 ⇒ 能穿过 edge），**绝不打** /plugin/remote/live",
+		reachBox.calls.fetch.every((call) => call.input !== internals.LIVE_PATH));
+	check("非回环会话：**只有 1 次**不可达时不动手（不是「一次就弹回」）",
+		reachBox.calls.reloads === 0 && reachBox.storage.get(internals.STORAGE_KEYS.current) === "home"
+		&& reachBox.slot.checks().selfHealRan === false,
+		`reloads=${String(reachBox.calls.reloads)}`);
+	await reachBox.clock.advance(2000);
+	check("连续 2 次不可达 ⇒ 清掉 current 两个键 + **只**刷新一次回本机（复用 resetToLocal 的冷却/哨兵）",
+		reachBox.calls.reloads === 1 && currentKeysGone(reachBox) && reachBox.slot.checks().selfHealRan === true,
+		`reloads=${String(reachBox.calls.reloads)} selfHealRan=${String(reachBox.slot.checks().selfHealRan)}`);
+	check("决定之后就把探测停掉（不再打第三枪、也不留定时器）",
+		reachBox.slot.checks().timers.length === 0);
+	const reachProbes = reachBox.calls.fetch.filter((call) => call.input === internals.VIEW_PATH).length;
+	await reachBox.clock.advance(20000);
+	check("重置之后不再探测（推进 20 秒也没多一条）",
+		reachBox.calls.fetch.filter((call) => call.input === internals.VIEW_PATH).length === reachProbes,
+		`${String(reachProbes)} → ${String(reachBox.calls.fetch.filter((call) => call.input === internals.VIEW_PATH).length)}`);
+
+	// ② 回环会话（默认 127.0.0.1）：一个定时器都不登记、一条探测都不打、绝不自动弹回。
+	const loopHealBox = bootShimWithClock({
+		current: "home",
+		devices: [{ id: "home", name: "家里台" }],
+		deviceSeed: [{ id: "home", name: "家里台" }],
+		viewState: { peers: unreachablePeers("home") },
+	});
+	await loopHealBox.clock.advance(20000);
+	check("回环会话（127.0.0.1）：不登记定时器、不打探测、连续再久也**绝不**自动弹回",
+		loopHealBox.slot.checks().timers.length === 0 && loopHealBox.calls.reloads === 0
+		&& loopHealBox.storage.get(internals.STORAGE_KEYS.current) === "home"
+		&& loopHealBox.calls.fetch.every((call) => call.input !== internals.VIEW_PATH),
+		`timers=${JSON.stringify(loopHealBox.slot.checks().timers)} reloads=${String(loopHealBox.calls.reloads)}`);
+
+	// ③ 桌面壳（dsh-app://app/）：**不是 http(s)** ⇒ 同样不动手（用户明确不要桌面端被弹回）。
+	const deskHealBox = bootShimWithClock({
+		current: "home",
+		devices: [{ id: "home", name: "家里台" }],
+		deviceSeed: [{ id: "home", name: "家里台" }],
+		location: { href: "dsh-app://app/", host: "app", hostname: "app", protocol: "dsh-app:", pathname: "/", reload() {} },
+		viewState: { peers: unreachablePeers("home") },
+	});
+	await deskHealBox.clock.advance(20000);
+	check("桌面壳（dsh-app://app/）：不登记定时器、不打探测、绝不弹回（桌面端不受影响）",
+		deskHealBox.slot.checks().timers.length === 0 && deskHealBox.calls.reloads === 0
+		&& deskHealBox.calls.fetch.every((call) => call.input !== internals.VIEW_PATH));
+
+	// ④ 未知 ≠ 不可达：聚合里**没有这台** / 读不到（403）⇒ 计数清零，绝不重置。
+	const otherView = { peers: [{ id: "office", name: "办公室台", reachable: false, lastError: "连接超时", live: null }] };
+	const unknownBox = bootShimWithClock({
+		current: "home",
+		devices: [{ id: "home", name: "家里台" }, { id: "office", name: "办公室台" }],
+		deviceSeed: [{ id: "home", name: "家里台" }, { id: "office", name: "办公室台" }],
+		location: browserLocation("nas.example.com"),
+		viewState: otherView,
+	});
+	await unknownBox.clock.advance(20000);
+	check("未知（聚合里没有当前这台）⇒ 探多少次都不重置（未知 ≠ 不可达）",
+		unknownBox.calls.reloads === 0 && unknownBox.storage.get(internals.STORAGE_KEYS.current) === "home");
+
+	const refusedBox = bootShimWithClock({
+		current: "home",
+		devices: [{ id: "home", name: "家里台" }],
+		deviceSeed: [{ id: "home", name: "家里台" }],
+		location: browserLocation("nas.example.com"),
+		viewState: { status: 403, peers: unreachablePeers("home") },
+	});
+	await refusedBox.clock.advance(20000);
+	check("读不到聚合（403 / 会话不可信）⇒ 未知 ⇒ 不重置（也不当成「连不上」）",
+		refusedBox.calls.reloads === 0 && refusedBox.storage.get(internals.STORAGE_KEYS.current) === "home");
+
+	// ⑤ "连续"是严格的：中间夹一次未知就打断计数（不是"累计 2 次"）。
+	const flipView = { peers: unreachablePeers("home") };
+	const flipBox = bootShimWithClock({
+		current: "home",
+		devices: [{ id: "home", name: "家里台" }],
+		deviceSeed: [{ id: "home", name: "家里台" }],
+		location: browserLocation("nas.example.com"),
+		viewState: flipView,
+	});
+	flipView.peers = []; // 第 2 次 = 未知 ⇒ 打断
+	await flipBox.clock.advance(2000);
+	flipView.peers = unreachablePeers("home"); // 第 3 次 = 又不可达（这一次只是新的第 1 次）
+	await flipBox.clock.advance(2000);
+	check("中间夹一次未知就打断「连续」计数（第 3 次只是新的第 1 次 ⇒ 仍然不动手）",
+		flipBox.calls.reloads === 0 && flipBox.storage.get(internals.STORAGE_KEYS.current) === "home");
+	await flipBox.clock.advance(2000);
+	check("打断之后又连续 2 次不可达（第 3 + 第 4 次）⇒ 这才重置",
+		flipBox.calls.reloads === 1 && currentKeysGone(flipBox));
+
+	// ------------------------------------------------------------------
+	// K2（2026-10-17 第二刀那组用例）**已整段删除**（第三刀）：
+	//
+	// 上一刀往垫片里加了一颗「左上角常驻『← 本机』小按钮」（纯原生 DOM，`KEYS_CURRENT` 非空就挂），
+	// 配套 8 条用例（显隐 / 文案 title / 样式 / 挂载点 / 点击清键 + 刷新 / 重跑不复活 / dispose 幂等）。
+	// 用户真机实测后认为它**多余且丑**：白屏已从 15 秒降到 2–3 秒、界面基本都会渲染出来，
+	// 正常切换器（客户端半的侧栏那一行 + 浮层）就够用 ⇒ 那颗按钮连同 `dispose` 一起删掉，
+	// 这 8 条用例随之删除。**"垫片一个 DOM 节点都不插"这条不变式改由上面 K1 ④ 那条覆盖**
+	// （断言 `dom.body.children.length === 0` + 不打探针 + 不登记定时器）。
+	// ------------------------------------------------------------------
+
+
+	// ------------------------------------------------------------------
+	// K3（2026-10-17 第四刀）：垫片**无声发布设备表** —— 浏览器里唯一还拿得到的设备表来源
+	//
+	// 背景（真机 bug，用户实测）：`GET /plugin/remote/live` 经 edge 一律 403（`/plugin/` 被
+	// `EDGE_BLOCKED_PREFIXES` 整段挡住），于是**任何浏览器打开的页面**都拿不到 `peers[]`；
+	// 而客户端半原来唯一的设备表来源（胶囊面板里的 `button[data-device-id]`）随着胶囊停用也断了
+	// ⇒ 浮层里只剩「本机」，连切设备都做不到。
+	// 修法：垫片把同一份设备快照**无声发布**两份（全局快照 + 隐藏 JSON 节点），客户端半按优先级读。
+	// 本组用例盯：内容正确（本机空 id + current 标记）、隐藏节点不可见/不占位、幂等、
+	// 热重载刷新、softOff 撤销，以及"**不新增任何网络请求**、body 依旧一个节点都没有"。
+	// ------------------------------------------------------------------
+	section("K3 无声发布设备表：全局快照 + 隐藏 JSON 节点（浏览器列设备/切设备；不画可见 UI、不发请求）");
+
+	/** 垫片发布到全局的那份设备表（没发布就是 undefined）。 */
+	const publishedGlobal = (box) => box.sandbox.__DSH_REMOTE_DEVICES__;
+	/** 垫片的隐藏 JSON 节点（挂在 documentElement 上；自测的 body 版 getElementById 找不到它）。 */
+	const publishedNode = (box) => box.dom.findByIdIn(box.dom.document.documentElement, internals.SHIM_DEVICES_NODE_ID);
+	const devicesInNode = (box) => JSON.parse(String(publishedNode(box).textContent)).devices;
+
+	const publishLocalBox = bootShimWithClock({ current: "" });
+	check("发布到全局：`__DSH_REMOTE_DEVICES__` = 注入 payload 那份设备表，本机那条 id 是空串、排在最前",
+		Object.prototype.toString.call(publishedGlobal(publishLocalBox)) === "[object Array]"
+		&& publishedGlobal(publishLocalBox).length === 3
+		&& publishedGlobal(publishLocalBox)[0].id === ""
+		&& JSON.stringify(publishedGlobal(publishLocalBox).map((entry) => entry.id)) === JSON.stringify(["", "home", "office"]),
+		JSON.stringify(publishedGlobal(publishLocalBox)));
+	check("发布内容带名字（对端名字原样透传，不是只给 id）",
+		publishedGlobal(publishLocalBox)[1].name === "家里台" && publishedGlobal(publishLocalBox)[2].name === "办公室台",
+		JSON.stringify(publishedGlobal(publishLocalBox).map((entry) => `${entry.id}=${entry.name}`)));
+	check("选中本机（KEYS_CURRENT 空）⇒ 只有本机那条带 current:true，对端全是 false",
+		publishedGlobal(publishLocalBox).filter((entry) => entry.current === true).length === 1
+		&& publishedGlobal(publishLocalBox)[0].current === true
+		&& publishedGlobal(publishLocalBox)[1].current === false,
+		JSON.stringify(publishedGlobal(publishLocalBox).map((entry) => `${entry.id}:${String(entry.current)}`)));
+
+	const publishHomeBox = bootShimWithClock({ current: "home" });
+	check("`current` 标记跟着 KEYS_CURRENT 走（选 home ⇒ 本机那条 false、home 那条 true）",
+		publishedGlobal(publishHomeBox).filter((entry) => entry.current === true).length === 1
+		&& publishedGlobal(publishHomeBox)[1].current === true
+		&& publishedGlobal(publishHomeBox)[0].current === false,
+		JSON.stringify(publishedGlobal(publishHomeBox).map((entry) => `${entry.id}:${String(entry.current)}`)));
+
+	const publishNode = publishedNode(publishHomeBox);
+	check('隐藏 JSON 节点在：`<script type="application/json" id="dsh-remote-devices">`，挂在 documentElement 上',
+		publishNode !== null && publishNode !== undefined && publishNode.tagName === "SCRIPT"
+		&& publishNode.getAttribute("type") === "application/json"
+		&& publishNode.getAttribute("id") === internals.SHIM_DEVICES_NODE_ID
+		&& internals.SHIM_DEVICES_NODE_ID === "dsh-remote-devices"
+		&& publishNode.parentNode === publishHomeBox.dom.document.documentElement,
+		`node=${publishNode === null ? "null" : String(publishNode.tagName)} parentIsHtml=${String(publishNode !== null && publishNode.parentNode === publishHomeBox.dom.document.documentElement)}`);
+	check("隐藏节点**不可见、不占位**：`hidden === true` + `display:none`（`<script>` 本来就不渲染，双保险）",
+		publishNode.hidden === true && publishNode.style.display === "none",
+		`hidden=${String(publishNode.hidden)} display=${String(publishNode.style.display)}`);
+	check("隐藏节点内容是 `{\"devices\":[…]}`，与全局快照逐字一致（两份互为兜底）",
+		JSON.stringify({ devices: publishedGlobal(publishHomeBox) }) === JSON.stringify(JSON.parse(String(publishNode.textContent)))
+		&& devicesInNode(publishHomeBox).length === 3,
+		String(publishNode.textContent).slice(0, 120));
+	check("发布**不占位**：发布之后 body 下依然一个子节点都没有（K1 ④ 那条不变式照样成立）",
+		publishHomeBox.dom.body.children.length === 0,
+		`bodyChildren=${String(publishHomeBox.dom.body.children.length)}`);
+	check("发布**不新增任何网络请求**：垫片的请求仍然只有那两枪（`POST /plugin/remote/hello` 报到 + `GET /plugin/remote/state` 自检）",
+		publishHomeBox.calls.fetch.length >= 1
+		&& publishHomeBox.calls.fetch.every((call) => call.input === internals.STATE_PATH || call.input === internals.HELLO_PATH),
+		JSON.stringify(publishHomeBox.calls.fetch.map((call) => call.input)));
+	check("脚本里带着那个节点 id（导出的 `internals.SHIM_DEVICES_NODE_ID` 与注入文本逐字一致，防漂移）",
+		SHIM_TEXT.includes(internals.SHIM_DEVICES_NODE_ID)
+		&& SHIM_TEXT.includes("__DSH_REMOTE_DEVICES__"),
+		`id=${internals.SHIM_DEVICES_NODE_ID}`);
+
+	// 幂等 + 配置热重载：宿主半换设备表后会**重新注入同一份脚本**（新 payload 进同一个窗口）。
+	const reloadBox = bootShimWithClock({ current: "home" });
+	const nodesBefore = reloadBox.dom.document.documentElement.children.filter((child) => child.id === internals.SHIM_DEVICES_NODE_ID).length;
+	runShim(reloadBox, internals.renderShimScript({
+		devices: [{ id: "home", name: "家里台（改名后）" }, { id: "office", name: "办公室台" }],
+		localName: "本机",
+	}));
+	check("二次执行（配置热重载的落点）：隐藏节点**只有一个**（不重复插），body 依旧干净",
+		nodesBefore === 1
+		&& reloadBox.dom.document.documentElement.children.filter((child) => child.id === internals.SHIM_DEVICES_NODE_ID).length === 1
+		&& reloadBox.dom.body.children.length === 0,
+		`before=${String(nodesBefore)} after=${String(reloadBox.dom.document.documentElement.children.filter((child) => child.id === internals.SHIM_DEVICES_NODE_ID).length)}`);
+	check("热重载 ⇒ 发布内容同步刷新成新设备表（新 payload 的名字进了全局与节点，不改 patch 也不挂 UI）",
+		publishedGlobal(reloadBox)[1].name === "家里台（改名后）"
+		&& devicesInNode(reloadBox)[1].name === "家里台（改名后）"
+		&& publishedGlobal(reloadBox).length === 3
+		&& publishedGlobal(reloadBox)[1].current === true
+		&& noShimUi(reloadBox),
+		JSON.stringify(publishedGlobal(reloadBox).map((entry) => `${entry.id}=${entry.name}`)));
+
+	// 停用 / 卸载：`enabled:false` 与 404 都走 softOff ⇒ 发布必须被撤掉（不然浏览器里会一直列着旧设备表）。
+	const retractBox = createShimSandbox({ current: "home", devices: [{ id: "home", name: "设备B" }], stateBody: { enabled: false } });
+	runShim(retractBox, SHIM_TEXT);
+	check("前置条件：正常模式下（老窗口）发布已经就位",
+		publishedGlobal(retractBox) !== undefined && publishedNode(retractBox) !== null,
+		`global=${String(publishedGlobal(retractBox) !== undefined)} node=${String(publishedNode(retractBox) !== null)}`);
+	await sleep(0);
+	check("自检拿到 enabled:false ⇒ softOff 把全局快照清掉（不留脏数据）",
+		retractBox.sandbox.__DSH_REMOTE_DEVICES__ === undefined
+		&& retractBox.sandbox.window === undefined,
+		`global=${String(retractBox.sandbox.__DSH_REMOTE_DEVICES__)}`);
+	check("自检拿到 enabled:false ⇒ softOff 把隐藏 JSON 节点也摘掉（documentElement 下一个都不剩）",
+		publishedNode(retractBox) === null
+		&& retractBox.dom.document.documentElement.children.filter((child) => child.id === internals.SHIM_DEVICES_NODE_ID).length === 0,
+		`node=${String(publishedNode(retractBox))}`);
+	check("撤销是幂等的：再调一次 `slot.retractDevices()` 也不报错、也没有节点冒出来",
+		(() => {
+			const slot = retractBox.sandbox.__DSH_REMOTE_SHIM__;
+			slot.retractDevices();
+			slot.retractDevices();
+			return publishedNode(retractBox) === null && retractBox.sandbox.__DSH_REMOTE_DEVICES__ === undefined;
+		})(),
+		`node=${String(publishedNode(retractBox))}`);
+
+	// 惰性窗口（注入时 enabled:false）：连"正常模式"都没进 ⇒ 一份都不许发布。
+	const lazyPublishBox = createShimSandbox({ current: "home", devices: [{ id: "home", name: "设备B" }], stateBody: { enabled: false } });
+	runShim(lazyPublishBox, internals.renderShimScript({
+		devices: [{ id: "home", name: "设备B" }],
+		localName: "本机",
+		statePath: internals.STATE_PATH,
+		enabled: false,
+		sentinelKey: internals.SHIM_SELFTEST_SENTINEL_KEY,
+	}));
+	await sleep(0);
+	check("注入时就是 enabled:false（惰性窗口）⇒ 全局与节点**一份都不发布**",
+		lazyPublishBox.sandbox.__DSH_REMOTE_DEVICES__ === undefined
+		&& publishedNode(lazyPublishBox) === null
+		&& lazyPublishBox.dom.body.children.length === 0,
+		`global=${String(lazyPublishBox.sandbox.__DSH_REMOTE_DEVICES__)} node=${String(publishedNode(lazyPublishBox))}`);
+
+	// ------------------------------------------------------------------
+
 
 	section("E7 响应头改写：Location / Set-Cookie 收到代理前缀下");
 	const device = {
@@ -2145,6 +2839,75 @@ async function main() {
 		internals.rewriteSetCookie("dsh-auth-x=y; Max-Age=315360000; Path=/; HttpOnly; SameSite=Strict", "/dev/self")
 			=== "dsh-auth-x=y; Max-Age=315360000; Path=/dev/self/; HttpOnly; SameSite=Strict",
 		internals.rewriteSetCookie("dsh-auth-x=y; Max-Age=1; Path=/; HttpOnly", "/dev/self"));
+
+	// ------------------------------------------------------------------
+	// E8：代理的可信请求判定（2026-10-15 只读审查补的：这条以前只有「另存为」有）
+	//
+	// 背景：`/dev/<id>/**` 会带上宿主侧的 cookie jar 转发到对面整台 DSH，等于"本机任意页面
+	// 借它操作对面"的通道。以前只有「另存为」那条路由有官方判定，代理这条没有。
+	// 修法：代理入口也跑同一个 authorizeTrustedRequest（失败即拒）。
+	// **happy path 不用另写**：上面 E1~E7 的代理用例默认 `requestRejection: () => undefined`
+	// （宿主替身的缺省），它们仍然全绿 = 官方判定放行时一切如常、没有误伤。
+	// ------------------------------------------------------------------
+	section("E8 代理的可信请求判定：拒绝时 403 不转发；宿主没有官方判定时一律拒");
+	const e8gatedSeed = (extra) => ({
+		dataFile: freshDataFile(),
+		devices: [{ id: "self", name: "假远端", url: `http://127.0.0.1:${stub.port}`, token: "stub-token" }],
+		current: "local",
+		...extra,
+	});
+	// ① 官方判定拒绝（403 = Host/Origin 栅栏没过）
+	const e8rejectRouter = createRouter({
+		credentials: seedCredentials,
+		connection: {
+			trustedHosts: ["192.0.2.4"],
+			browserAuth: { maxAgeMilliseconds: 3_650 * 86_400_000 },
+			authenticatedUrl: (base) => `${base}?token=stub`,
+			requestRejection: () => 403,
+		},
+	});
+	apply(e8rejectRouter.ctx, e8gatedSeed(), { muxPath: "/api/remote.mux" });
+	const e8rejectHost = await startFakeHost(e8rejectRouter);
+	const e8upstreamBefore = stub.requests.length;
+	const e8rejected = await httpGet(`http://127.0.0.1:${e8rejectHost.port}/dev/self/api/poked`);
+	check("代理：官方判定 403 → 本插件 403 text/plain，正文写明「被拒绝」与官方的码",
+		e8rejected.status === 403
+		&& String(e8rejected.headers.get("content-type")).toLowerCase().startsWith("text/plain")
+		&& e8rejected.body.includes("被拒绝") && e8rejected.body.includes("403"),
+		`status=${e8rejected.status} body=${JSON.stringify(e8rejected.body.slice(0, 90))}`);
+	notHtml("代理被拒（403）", e8rejected);
+	check("代理：被拒时**一个请求都没转发到上游**（上游计数不变）",
+		stub.requests.length === e8upstreamBefore,
+		`before=${e8upstreamBefore} after=${stub.requests.length}`);
+	check("代理：401 同样按官方码折成 403 text/plain（正文带 401）", await (async () => {
+		const e8code401Router = createRouter({
+			credentials: seedCredentials,
+			connection: {
+				trustedHosts: [],
+				browserAuth: { maxAgeMilliseconds: 3_650 * 86_400_000 },
+				authenticatedUrl: (base) => `${base}?token=stub`,
+				requestRejection: () => 401,
+			},
+		});
+		apply(e8code401Router.ctx, e8gatedSeed(), { muxPath: "/api/remote.mux" });
+		const e8code401Host = await startFakeHost(e8code401Router);
+		const e8exchange = await httpGet(`http://127.0.0.1:${e8code401Host.port}/dev/self/api/x`);
+		await e8code401Host.close();
+		return e8exchange.status === 403 && e8exchange.body.includes("401");
+	})());
+	await e8rejectHost.close();
+	// ② 宿主连官方判定都没有（老 DSH）→ **一律拒绝**（fail-closed），不是放行。
+	const e8noVerdictRouter = createRouter({
+		credentials: seedCredentials,
+		connection: { trustedHosts: [], authenticatedUrl: (base) => base },
+	});
+	apply(e8noVerdictRouter.ctx, e8gatedSeed(), { muxPath: "/api/remote.mux" });
+	const e8noVerdictHost = await startFakeHost(e8noVerdictRouter);
+	const e8noVerdict = await httpGet(`http://127.0.0.1:${e8noVerdictHost.port}/dev/self/api/x`);
+	check("代理：宿主没有 connection.requestRejection → 403 且写明「没有提供官方的可信请求判定」（降级为拒绝）",
+		e8noVerdict.status === 403 && e8noVerdict.body.includes("requestRejection"),
+		JSON.stringify(e8noVerdict.body.slice(0, 120)));
+	await e8noVerdictHost.close();
 
 	// ------------------------------------------------------------------
 	// F：本机自验证（沿用 device-switch 的 F 组）
@@ -2184,18 +2947,17 @@ async function main() {
 		!autoText.includes('"id":"company"') && autoText.includes('"id":"home"'));
 	const autoBox = createShimSandbox({});
 	runShim(autoBox, autoText);
-	check("沙箱（未选中=本机）：胶囊是「设备：设备A · 本机」",
-		autoBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-toggle`)?.textContent === "设备：设备A · 本机",
-		autoBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-toggle`)?.textContent);
-	const autoPanel = autoBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-panel`)?.innerHTML ?? "";
-	check("沙箱：菜单本机项含 hostname，设备项只有远端那台",
-		autoPanel.includes("设备A（本机 my-pc）") && !autoPanel.includes('data-device-id="company"')
-		&& autoPanel.includes('data-device-id="home"'));
+	check("沙箱（未选中=本机）：胶囊 UI 已停用 ⇒ 不挂任何 UI（localCaption 仍在 payload 里，供回退）",
+		noShimUi(autoBox) && autoText.includes('"localCaption":"设备A · 本机"'),
+		String(autoBox.dom.findById(`${PILL_ELEMENT_ID}-toggle`)));
+	check("沙箱：设备表（本机项带 hostname / 远端那台）仍在 payload 里，只是不再画出来",
+		autoText.includes('"localName":"设备A（本机 my-pc）"') && autoText.includes('"id":"home"')
+		&& !autoText.includes('"id":"company"') && noShimUi(autoBox));
 	const autoHomeBox = createShimSandbox({ current: "home" });
 	runShim(autoHomeBox, autoText);
-	check("沙箱（选中远端）：胶囊仍是「设备：设备B」（与旧版一致）",
-		autoHomeBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-toggle`)?.textContent === "设备：设备B",
-		autoHomeBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-toggle`)?.textContent);
+	check("沙箱（选中远端）：也不挂 UI，但改写仍按 home 走（停用画 UI ≠ 停用切设备）",
+		noShimUi(autoHomeBox) && fetchTarget(autoHomeBox, "api/sessions") === "/dev/home/api/sessions",
+		`toggle=${String(autoHomeBox.dom.findById(`${PILL_ELEMENT_ID}-toggle`))} target=${fetchTarget(autoHomeBox, "api/sessions")}`);
 
 	section("F2 自动匹配一条都没命中 → 回退数据文件的 current");
 	const fallbackRouter = createRouter();
@@ -2237,10 +2999,11 @@ async function main() {
 	check("胶囊短标签退化为「本机」", noneText.includes('"localCaption":"本机"'));
 	const noneBox = createShimSandbox({});
 	runShim(noneBox, noneText);
-	check("沙箱：胶囊是「设备：本机」，菜单里既有本机项（带 hostname）也有那台设备",
-		noneBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-toggle`)?.textContent === "设备：本机"
-		&& (noneBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-panel`)?.innerHTML ?? "").includes("本机（my-pc）")
-		&& (noneBox.dom.findById(`${internals.SWITCHER_ELEMENT_ID}-panel`)?.innerHTML ?? "").includes('data-device-id="home"'));
+	check("沙箱：胶囊 UI 已停用 ⇒ 不挂 UI；payload 里既有本机项（带 hostname）也有那台设备",
+		noShimUi(noneBox)
+		&& noneText.includes('"localName":"本机（my-pc）"')
+		&& noneText.includes('"id":"home"'),
+		String(noneBox.dom.findById(`${PILL_ELEMENT_ID}-panel`)));
 
 	section("F4 跨平台细节：hostname 大小写、url 不带端口、https、端口不再硬性要求、0.0.0.0");
 	const unitCtx = createRouter().ctx;
@@ -2534,12 +3297,13 @@ async function main() {
 		offRows.length === 1 && offRows[0].kind === "script" && offRows[0].placement === "head",
 		JSON.stringify(offRows.map((row) => `${row.kind}/${row.placement}`)));
 	const offText = typeof offRows[0]?.text === "string" ? offRows[0].text : "";
-	check("停用时注入的脚本里 enabled=false（垫片据此不同步 patch、不挂胶囊）",
+	check("停用时注入的脚本里 enabled=false（垫片据此不同步 patch、不挂任何 UI）",
 		offText.includes('"enabled":false') || offText.includes("enabled:!1"),
 		offText.slice(offText.lastIndexOf("})("), offText.lastIndexOf("})(") + 160));
-	check("停用时注入的脚本仍带自检（statePath + 清键 + 摘胶囊 + 哨兵刷新）",
+	check("停用时注入的脚本仍带自检（statePath + 清键 + 撤设备表 + 停探测 + 哨兵刷新）",
 		offText.includes(internals.STATE_PATH) && offText.includes("checkHostState")
-		&& offText.includes("clearStoredSelection") && offText.includes("removePill") && offText.includes("reloadOnce")
+		&& offText.includes("clearStoredSelection") && offText.includes("retractDeviceTable")
+		&& offText.includes("healStop") && offText.includes("reloadOnce")
 		&& offText.includes(internals.SHIM_SELFTEST_SENTINEL_KEY));
 	check("停用时 /dev/** 路由数与升级路由数都是 0（注入与路由是两件事）",
 		router.devPrefixes().length === 0 && router.upgrades.size === 0);
@@ -4078,6 +4842,676 @@ async function main() {
 		check("停用后那个对外端口真的关上了", gone === true);
 		await page.close();
 	}
+
+	// ------------------------------------------------------------------
+	// L：跨机实时状态（生产 + 聚合）—— 本机页面口 + 跨机取数口
+	// ------------------------------------------------------------------
+	section("L1 /plugin/remote/live：聚合形状 + 对端可达性语义（404 不画红、网络错才红）");
+
+	/** 假对端 DSH：`GET /dsh-remote-live` 回自己的 live，`POST .../seen` 回清完的 live。 */
+	const startFakeLivePeer = async (options = {}) => {
+		const calls = { get: 0, seen: 0, paths: [], methods: [] };
+		const server = createServer((req, res) => {
+			let pathname = "/";
+			try {
+				pathname = new URL(req.url ?? "/", "http://local.invalid").pathname;
+			} catch {
+				pathname = "/";
+			}
+			calls.paths.push(pathname);
+			calls.methods.push(req.method);
+			req.resume();
+			req.on("end", () => {
+				if (options.status !== undefined && options.status !== 200) {
+					res.writeHead(options.status, { "content-type": "text/html; charset=utf-8" });
+					res.end("<html><body>nope</body></html>");
+					return;
+				}
+				const live = { ...(options.live ?? { running: 2, pending: 1, unread: true, doneAt: 111, at: 222 }) };
+				if (pathname === internals.PEER_LIVE_SEEN_PATH && req.method === "POST") {
+					calls.seen += 1;
+					live.unread = false;
+				} else {
+					calls.get += 1;
+				}
+				res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+				res.end(JSON.stringify({ at: Date.now(), live }));
+			});
+		});
+		await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+		return {
+			port: server.address().port,
+			calls,
+			close: () => new Promise((resolve) => server.close(resolve)),
+		};
+	};
+
+	/** 一个**没人听**的端口（先占用再关掉）：用来制造"连接失败"这类网络错误。 */
+	const freeDeadPort = async () => {
+		const server = createServer(() => {});
+		await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+		const port = server.address().port;
+		await new Promise((resolve) => server.close(resolve));
+		return port;
+	};
+
+	const liveUp = await startFakeLivePeer();
+	const liveOld = await startFakeLivePeer({ status: 404 });
+	const liveDeadPort = await freeDeadPort();
+
+	const liveItems = { value: [] };
+	const liveListCalls = { count: 0, signals: 0 };
+	const liveFile = join(workDir, "live-l1.json");
+	// 注意：`sessionController` 不能塞进 createRouter 的 options.services（那里已经 defineProperty 过一次，
+	// 重定义会抛）；照 H5b/H6 的做法用 `ctx._provide` 在 apply 之后再给（这也正好走一遍真实的
+	// "服务晚到 → ctx.inject 回调才触发" 路线）。
+	const liveRouter = createRouter();
+	apply(liveRouter.ctx, {
+		dataFile: freshDataFile(),
+		liveFile,
+		current: "me",
+		devices: [
+			{ id: "me", name: "本机台", url: "http://127.0.0.1:9" },
+			{ id: "up", name: "家里台", url: `http://127.0.0.1:${liveUp.port}` },
+			{ id: "old", name: "老版本台", url: `http://127.0.0.1:${liveOld.port}` },
+			{ id: "dead", name: "关着的台", url: `http://127.0.0.1:${liveDeadPort}` },
+		],
+	}, { muxPath: "/api/remote.mux", livePollMs: 40 });
+	liveRouter.ctx._provide("sessionController", {
+		async list(_request, signal) {
+			liveListCalls.count += 1;
+			if (signal !== undefined && signal !== null && typeof signal.throwIfAborted === "function") liveListCalls.signals += 1;
+			return { items: liveItems.value };
+		},
+	});
+	const liveHost = await startFakeHost(liveRouter);
+	const liveBase = `http://127.0.0.1:${liveHost.port}${internals.PLUGIN_ROUTE}`;
+	await sleep(300);
+
+	const liveResp = await httpJson(`${liveBase}/live`);
+	notHtml("GET /plugin/remote/live", liveResp);
+	const liveJson = liveResp.json;
+	check("GET /plugin/remote/live → 200 JSON，顶层正好 {at, self, peers}",
+		liveResp.status === 200 && liveJson !== null
+		&& JSON.stringify(Object.keys(liveJson).sort()) === JSON.stringify(["at", "peers", "self"]),
+		JSON.stringify(Object.keys(liveJson ?? {})).slice(0, 120));
+	check("self 正好 {name, live}（name = 本机被认领那条设备的名字，空串 = 没认领到），live 正好那 5 个字段（running/pending/unread/doneAt/at）",
+		liveJson !== null && JSON.stringify(Object.keys(liveJson.self).sort()) === JSON.stringify(["live", "name"])
+		&& typeof liveJson.self.name === "string"
+		&& JSON.stringify(Object.keys(liveJson.self.live).sort()) === JSON.stringify(["at", "doneAt", "pending", "running", "unread"]),
+		JSON.stringify(liveJson === null ? null : liveJson.self));
+	check("peers = 设备表减去被认领为本机的那条：3 台，id/name 取自设备配置",
+		Array.isArray(liveJson?.peers)
+		&& JSON.stringify(liveJson.peers.map((peer) => peer.id)) === JSON.stringify(["up", "old", "dead"])
+		&& JSON.stringify(liveJson.peers.map((peer) => peer.name)) === JSON.stringify(["家里台", "老版本台", "关着的台"]),
+		JSON.stringify((liveJson?.peers ?? []).map((peer) => [peer.id, peer.name])));
+	check("peers[] 每个节点正好 5 个字段（id/name/reachable/lastError/live）",
+		Array.isArray(liveJson?.peers) && liveJson.peers.every((peer) => JSON.stringify(Object.keys(peer).sort())
+			=== JSON.stringify(["id", "lastError", "live", "name", "reachable"])),
+		JSON.stringify((liveJson?.peers ?? []).map((peer) => Object.keys(peer))));
+
+	const peerOf = (id) => (Array.isArray(liveJson?.peers) ? liveJson.peers.find((peer) => peer.id === id) : undefined);
+	const peerUp = peerOf("up");
+	check("对端 200 + 合法 JSON → reachable=true，live 就是它报的那份（逐字段）",
+		peerUp?.reachable === true && peerUp?.lastError === ""
+		&& peerUp?.live?.running === 2 && peerUp?.live?.pending === 1 && peerUp?.live?.unread === true
+		&& peerUp?.live?.doneAt === 111 && peerUp?.live?.at === 222,
+		JSON.stringify(peerUp));
+	const peerOld = peerOf("old");
+	check("对端 **404**（还没升级）→ reachable=true、live=null、lastError 空（页面**不画红**）",
+		peerOld?.reachable === true && peerOld?.live === null && peerOld?.lastError === "",
+		JSON.stringify(peerOld));
+	const peerDead = peerOf("dead");
+	check("对端**连接失败** → reachable=false + lastError 有内容、live=null（只有这种才画红）",
+		peerDead?.reachable === false && peerDead?.live === null
+		&& typeof peerDead?.lastError === "string" && peerDead.lastError.length > 0,
+		JSON.stringify(peerDead));
+	check("被认领为本机的那条**不在 peers 里**（本机自己永远不是红的那个）",
+		(liveJson?.peers ?? []).every((peer) => peer.id !== "me") === true);
+	check("本机生产者真的在轮询，且每次都传了 AbortSignal（ctx.sessionController.list 的硬要求）",
+		liveListCalls.count > 0 && liveListCalls.signals === liveListCalls.count,
+		`count=${String(liveListCalls.count)} signals=${String(liveListCalls.signals)}`);
+
+	section("L2 跨机取数口 /dsh-remote-live：新注册的路径 + 非 /plugin/ 前缀 + 可信请求守卫");
+	check("取数口是**新注册**的独立前缀，且**故意不带 /plugin/**（否则会被对端 edge 的 EDGE_BLOCKED_PREFIXES 403 掉）",
+		internals.PEER_LIVE_ROOT === "/dsh-remote-live"
+		&& !internals.PEER_LIVE_ROOT.startsWith("/plugin/")
+		&& liveRouter.prefixes.has(internals.PEER_LIVE_ROOT),
+		JSON.stringify([...liveRouter.prefixes.keys()]));
+	const selfLive = await httpJson(`http://127.0.0.1:${liveHost.port}${internals.PEER_LIVE_PATH}`);
+	notHtml("GET /dsh-remote-live", selfLive);
+	check("取数口只回 {at, live}（**绝不回**聚合的 self/peers，避免跨机递归取数）",
+		selfLive.status === 200 && selfLive.json !== null
+		&& JSON.stringify(Object.keys(selfLive.json).sort()) === JSON.stringify(["at", "live"])
+		&& selfLive.json.self === undefined && selfLive.json.peers === undefined,
+		JSON.stringify(selfLive.json).slice(0, 120));
+	check("取数口的 live 与本机页面口 self.live 逐字段一致（同一个生产者）",
+		JSON.stringify(selfLive.json?.live) === JSON.stringify(liveJson?.self?.live),
+		`${JSON.stringify(selfLive.json?.live)} vs ${JSON.stringify(liveJson?.self?.live)}`);
+	const peerBadMethod = await httpJson(`http://127.0.0.1:${liveHost.port}${internals.PEER_LIVE_PATH}`, { method: "POST", body: {} });
+	check("取数口非 GET/HEAD → 405（不是 200、也不是 HTML）", peerBadMethod.status === 405, String(peerBadMethod.status));
+	notHtml("POST /dsh-remote-live（405）", peerBadMethod);
+
+	/** 起一个"守卫会拒绝"的实例（官方判定返回给定码；undefined = 宿主根本没有判定）。 */
+	const liveGate = async (verdict) => {
+		const gateRouter = createRouter({
+			connection: {
+				trustedHosts: ["192.0.2.4"],
+				browserAuth: { maxAgeMilliseconds: 86_400_000 },
+				authenticatedUrl: (base) => `${base}?token=stub`,
+				...(verdict === undefined ? {} : { requestRejection: () => verdict }),
+			},
+		});
+		apply(gateRouter.ctx, { dataFile: freshDataFile() }, { muxPath: "/api/remote.mux" });
+		const gateHost = await startFakeHost(gateRouter);
+		const exchange = await httpGet(`http://127.0.0.1:${gateHost.port}${internals.PEER_LIVE_PATH}`);
+		await gateHost.close();
+		return exchange;
+	};
+	const gated403 = await liveGate(403);
+	check("取数口守卫 = 官方可信请求判定：Host/Origin 栅栏没过（403）→ 403 text/plain，正文写明被拒绝",
+		gated403.status === 403 && String(gated403.headers.get("content-type")).toLowerCase().startsWith("text/plain")
+		&& gated403.body.includes("被拒绝") && gated403.body.includes("403"),
+		`${String(gated403.status)} ${JSON.stringify(gated403.body.slice(0, 80))}`);
+	notHtml("取数口被拒（403）", gated403);
+	const gated401 = await liveGate(401);
+	check("取数口：栅栏过了但没有会话 cookie（401）→ 同样 403，正文带 401",
+		gated401.status === 403 && gated401.body.includes("401"), JSON.stringify(gated401.body.slice(0, 90)));
+	const gatedNone = await liveGate(undefined);
+	check("宿主没有官方判定（老 DSH）→ fail-closed 403，正文写明 requestRejection",
+		gatedNone.status === 403 && gatedNone.body.includes("requestRejection"), JSON.stringify(gatedNone.body.slice(0, 110)));
+
+	// ------------------------------------------------------------------
+	// L2b（0.12.0）：**浏览器口** `GET /dsh-remote-view`
+	//
+	// 为什么要有它：edge（对外端口）只拦 `/plugin/` 前缀，所以走 edge 的浏览器里
+	// `/plugin/remote/live` 永远 403（状态点一个都画不出来）；`/dsh-remote-live` 又是
+	// **跨机取数口**（只回本机自己、防跨机递归），语义不能动。于是新开这一条**非 `/plugin/`**
+	// 的聚合口：同形聚合 + `version`，守卫用官方的可信请求判定（与「另存为」同一把尺子）。
+	// 本组用例盯：路径形状、注册、可信守卫（含伪造请求被拒且不泄漏聚合）、
+	// 返回形状（同形 + version）、以及**页面口与跨机取数口一个字没变**。
+	// ------------------------------------------------------------------
+	section("L2b 浏览器口 /dsh-remote-view（0.12.0）：非 /plugin/ 前缀 + 同形聚合 + version + 可信守卫");
+	check("浏览器口是新注册的独立前缀，**故意不带 /plugin/**，且与跨机取数口不是同一条",
+		internals.VIEW_PATH === "/dsh-remote-view"
+		&& !internals.VIEW_PATH.startsWith("/plugin/")
+		&& internals.VIEW_PATH !== internals.PEER_LIVE_ROOT
+		&& liveRouter.prefixes.has(internals.VIEW_PATH),
+		JSON.stringify([...liveRouter.prefixes.keys()]));
+	const viewResp = await httpJson(`http://127.0.0.1:${liveHost.port}${internals.VIEW_PATH}`);
+	notHtml("GET /dsh-remote-view", viewResp);
+	check("浏览器口 → 200 JSON，顶层 = 页面口那三个键 **+ version**（只多这一个字段）",
+		viewResp.status === 200 && viewResp.json !== null
+		&& JSON.stringify(Object.keys(viewResp.json).sort()) === JSON.stringify(["at", "peers", "self", "version"]),
+		JSON.stringify(Object.keys(viewResp.json ?? {})).slice(0, 140));
+	check("version = 本机 dsh-remote 的版本号（internals.VERSION，与 package.json 的对账在 T0）",
+		viewResp.json?.version === internals.VERSION && internals.VERSION === "0.12.0",
+		String(viewResp.json?.version));
+	check("self / peers 与页面口**逐字段同形**（同一个 builder：键集与对端 id 完全一致；`at` 这类时间戳本来就每次都变）",
+		JSON.stringify(Object.keys(viewResp.json?.self ?? {}).sort()) === JSON.stringify(Object.keys(liveJson?.self ?? {}).sort())
+		&& JSON.stringify((viewResp.json?.peers ?? []).map((peer) => Object.keys(peer).sort().join(",")))
+			=== JSON.stringify((liveJson?.peers ?? []).map((peer) => Object.keys(peer).sort().join(",")))
+		&& JSON.stringify((viewResp.json?.peers ?? []).map((peer) => peer.id)) === JSON.stringify((liveJson?.peers ?? []).map((peer) => peer.id)),
+		`self=${JSON.stringify(Object.keys(viewResp.json?.self ?? {}))} peers=${JSON.stringify((viewResp.json?.peers ?? []).map((peer) => Object.keys(peer).sort()))}`);
+	check("浏览器口非 GET/HEAD → 405（不是 200、也不是 HTML）",
+		(await httpJson(`http://127.0.0.1:${liveHost.port}${internals.VIEW_PATH}`, { method: "POST", body: {} })).status === 405);
+	check("浏览器口只认自己那条路径（前缀路由下的子路径 404，不乱答）",
+		(await httpJson(`http://127.0.0.1:${liveHost.port}${internals.VIEW_PATH}/x`)).status === 404,
+		String((await httpJson(`http://127.0.0.1:${liveHost.port}${internals.VIEW_PATH}/x`)).status));
+	// 页面口 / 跨机取数口的语义**一个字没变**：页面口没有 version，跨机口仍然只回 {at, live}。
+	const liveAgain = (await httpJson(`${liveBase}/live`)).json;
+	check("页面口 /plugin/remote/live **没有** version（同形 ≠ 同一条；它只认回环、形状未变）",
+		liveAgain !== null && liveAgain.version === undefined
+		&& JSON.stringify(Object.keys(liveAgain).sort()) === JSON.stringify(["at", "peers", "self"]),
+		JSON.stringify(Object.keys(liveAgain ?? {})));
+	const peerAgain = (await httpJson(`http://127.0.0.1:${liveHost.port}${internals.PEER_LIVE_PATH}`)).json;
+	check("跨机取数口 /dsh-remote-live 语义未变：仍然只回本机自己的 {at, live}（不聚合、不带 version）",
+		peerAgain !== null && JSON.stringify(Object.keys(peerAgain).sort()) === JSON.stringify(["at", "live"])
+		&& peerAgain.self === undefined && peerAgain.peers === undefined && peerAgain.version === undefined,
+		JSON.stringify(peerAgain ?? {}).slice(0, 120));
+
+	/** 起一个"守卫按请求头判定"的实例：带**跨站 Origin** 的伪造请求一律 403（模拟官方的 Host/Origin 栅栏）。 */
+	const viewForge = async () => {
+		const forgeRouter = createRouter({
+			connection: {
+				trustedHosts: ["192.0.2.4"],
+				browserAuth: { maxAgeMilliseconds: 86_400_000 },
+				authenticatedUrl: (base) => `${base}?token=stub`,
+				requestRejection: (req) => {
+					const headers = req.headers ?? {};
+					const origin = String(headers.origin ?? "");
+					if (origin !== "" && origin !== `http://${String(headers.host ?? "")}`) return 403;
+					return undefined;
+				},
+			},
+		});
+		apply(forgeRouter.ctx, { dataFile: freshDataFile() }, { muxPath: "/api/remote.mux" });
+		const forgeHost = await startFakeHost(forgeRouter);
+		// 伪造请求必须用**裸 http** 发：fetch 会把 `origin` 当禁改头丢掉，测不出跨站那条栅栏。
+		const forged = await new Promise((resolve, reject) => {
+			const request = httpRequest({
+				host: "127.0.0.1",
+				port: forgeHost.port,
+				path: internals.VIEW_PATH,
+				method: "GET",
+				headers: { origin: "http://evil.example" },
+			}, (response) => {
+				let body = "";
+				response.setEncoding("utf8");
+				response.on("data", (chunk) => { body += chunk; });
+				response.on("end", () => resolve({ status: response.statusCode, headers: response.headers, body }));
+			});
+			request.on("error", reject);
+			request.end();
+		});
+		const legit = await httpGet(`http://127.0.0.1:${forgeHost.port}${internals.VIEW_PATH}`);
+		await forgeHost.close();
+		return { forged, legit };
+	};
+	const { forged, legit } = await viewForge();
+	check("伪造请求（跨站 Origin / 不可信 Host）被官方判定拒掉：403 text/plain，**不泄漏聚合体**",
+		forged.status === 403 && String(forged.headers["content-type"] ?? "").toLowerCase().startsWith("text/plain")
+		&& forged.body.includes("被拒绝") && !forged.body.includes("peers") && !forged.body.includes(internals.VERSION),
+		`${String(forged.status)} ${JSON.stringify(forged.body.slice(0, 80))}`);
+	notHtml("浏览器口被拒（403）", forged);
+	check("同一台机器上不带 Origin 的可信请求照样 200（守卫只拦伪造，不是把浏览器口锁死）",
+		legit.status === 200 && String(legit.body).includes(internals.VERSION),
+		`${String(legit.status)} ${JSON.stringify(String(legit.body).slice(0, 80))}`);
+	const viewGate = async (verdict) => {
+		const gateRouter = createRouter({
+			connection: {
+				trustedHosts: ["192.0.2.4"],
+				browserAuth: { maxAgeMilliseconds: 86_400_000 },
+				authenticatedUrl: (base) => `${base}?token=stub`,
+				...(verdict === undefined ? {} : { requestRejection: () => verdict }),
+			},
+		});
+		apply(gateRouter.ctx, { dataFile: freshDataFile() }, { muxPath: "/api/remote.mux" });
+		const gateHost = await startFakeHost(gateRouter);
+		const exchange = await httpGet(`http://127.0.0.1:${gateHost.port}${internals.VIEW_PATH}`);
+		await gateHost.close();
+		return exchange;
+	};
+	const viewGated403 = await viewGate(403);
+	check("浏览器口守卫 = 官方可信请求判定：Host/Origin 栅栏没过（403）→ 403 text/plain + 正文写明",
+		viewGated403.status === 403 && viewGated403.body.includes("被拒绝") && viewGated403.body.includes("403"),
+		`${String(viewGated403.status)} ${JSON.stringify(viewGated403.body.slice(0, 80))}`);
+	const viewGated401 = await viewGate(401);
+	check("浏览器口：栅栏过了但没有会话 cookie（401）→ 同样 403，正文带 401",
+		viewGated401.status === 403 && viewGated401.body.includes("401"), JSON.stringify(viewGated401.body.slice(0, 90)));
+	const viewGatedNone = await viewGate(undefined);
+	check("宿主没有官方判定（老 DSH）→ fail-closed 403，正文写明 requestRejection",
+		viewGatedNone.status === 403 && viewGatedNone.body.includes("requestRejection"), JSON.stringify(viewGatedNone.body.slice(0, 110)));
+
+	section("L3 本机 unread：首轮不判完成、running 由 >0 变 0 才亮、落盘独立文件");
+	const selfLiveNow = async () => (await httpJson(`${liveBase}/live`)).json.self.live;
+	check("**首轮**（prevRunning 还没有基准）running=0 **不判完成**：unread=false、doneAt=0、at>0（轮询确实跑过）",
+		liveJson?.self?.live?.unread === false && liveJson?.self?.live?.doneAt === 0 && liveJson?.self?.live?.at > 0,
+		JSON.stringify(liveJson?.self?.live));
+	liveItems.value = [{ running: true }];
+	await sleep(200);
+	const afterRunning = await selfLiveNow();
+	check("有会话在跑：running=1，仍然 unread=false（没跑完之前绝不亮绿）",
+		afterRunning.running === 1 && afterRunning.unread === false, JSON.stringify(afterRunning));
+	liveItems.value = [{ running: true, sessionId: "s-amber", projections: { values: { userQuestions: { active: [{ callId: "c1" }, { callId: "c2" }] } } } }];
+	await sleep(200);
+	const afterPending = await selfLiveNow();
+	check("pending 再也**不看** projections.values.userQuestions.active（真机实测那个源恒为 0）⇒ 这里就是 0",
+		afterPending.running === 1 && afterPending.pending === 0, JSON.stringify(afterPending));
+	liveItems.value = [];
+	await sleep(200);
+	const afterDone = await selfLiveNow();
+	check("running 由 >0 变 0 的那一瞬置 unread=true + doneAt=Date.now()",
+		afterDone.running === 0 && afterDone.unread === true && afterDone.doneAt > 0, JSON.stringify(afterDone));
+	const liveOnDisk = readJsonFile(liveFile);
+	check("unread/doneAt **立刻落盘**到独立文件（正好只有这两个键）",
+		JSON.stringify(Object.keys(liveOnDisk).sort()) === JSON.stringify(["doneAt", "unread"])
+		&& liveOnDisk.unread === true && liveOnDisk.doneAt === afterDone.doneAt,
+		`${liveFile} → ${JSON.stringify(liveOnDisk)}`);
+	check("缺省落盘文件名就是 $DSH_HOME/dsh-remote-live.json（绝不用探针插件那份 dsh-device-panel-live.json）",
+		internals.LIVE_FILE_NAME === "dsh-remote-live.json"
+		&& internals.resolveLivePath({}) === join(internals.dshHome(), "dsh-remote-live.json"),
+		internals.resolveLivePath({}));
+
+	// ---- L3b 琥珀（pending）判定：尾页事件（2026-10-17 真机实测的两种卡）----
+	section("L3b pending（琥珀）：只算「卡在等用户回答/批准」的 running 会话，判据取自会话尾页事件");
+
+	// 一个最小的"运行时"替身：琥珀判定只读 `live`（状态）、`sessionController` 与 `ctx`（日志）。
+	// 这里**不用**那个真 runtime（`apply` 不返回它）：直接用 `internals.pollLocalLive` 走一遍真实代码路径。
+	const rt = {
+		ctx: liveRouter.ctx,
+		live: internals.createLiveState(),
+		sessionController: undefined,
+		localDevice: undefined,
+		devices: [],
+	};
+	const pendingStub = {
+		records: [],
+		/** `(sessionId) => records`：每条被读的会话拿到自己那份尾页。 */
+		recordsFor: () => [],
+		items: [],
+		projectionsCalls: 0,
+		pageCalls: 0,
+		/** false = 只实现 list()（老宿主半 / 接口形状不全会走的那条路）。 */
+		withPage: true,
+		pageError: false,
+		listError: false,
+		async projections(_request, signal) {
+			if (signal === undefined || signal === null || typeof signal.throwIfAborted !== "function") throw new Error("projections 缺 AbortSignal");
+			pendingStub.projectionsCalls += 1;
+			return { asOfSeq: 99, values: {} };
+		},
+		async page(request, signal) {
+			if (signal === undefined || signal === null || typeof signal.throwIfAborted !== "function") throw new Error("page 缺 AbortSignal");
+			pendingStub.pageCalls += 1;
+			if (pendingStub.pageError === true) throw new Error("page 炸了");
+			if (request.throughSeq !== 99) throw new Error(`page 必须带 asOfSeq 当 throughSeq，收到 ${JSON.stringify(request)}`);
+			return { records: pendingStub.recordsFor(request.address.sessionId), hasMore: false };
+		},
+		async list(_request, signal) {
+			if (signal === undefined || signal === null || typeof signal.throwIfAborted !== "function") throw new Error("list 缺 AbortSignal");
+			if (pendingStub.listError === true) throw new Error("list 炸了");
+			return { items: pendingStub.items };
+		},
+	};
+	const pendingNow = () => internals.liveViewOf(internals.liveStateOf(rt)).pending;
+	/** 真机上抓到的那三种尾巴（原样照抄 seq / data 字段）。 */
+	const tailAsk = [
+		{ type: "event", event: { type: "assistant/message", seq: 19, data: {} } },
+		{ type: "event", event: { type: "tool/call", seq: 21, data: { turn: 1, step: 1, callId: "call_00_ask", name: "ask_user_question", arguments: "{}" } } },
+	];
+	const tailAskSettled = [
+		...tailAsk,
+		{ type: "event", event: { type: "tool/result", seq: 23, data: { turn: 1, step: 1, message: { role: "tool", toolCallId: "call_00_ask" } } } },
+	];
+	const tailApproval = [
+		{ type: "event", event: { type: "approval/asked", seq: 31, data: { id: "d53feaa0-x", toolName: "write", callId: "call_00_w", reason: "escalate sandbox to workspace-write" } } },
+	];
+	const tailApprovalSettled = [
+		...tailApproval,
+		{ type: "event", event: { type: "approval/decided", seq: 33, data: { id: "d53feaa0-x", outcome: "allowed-once" } } },
+	];
+
+	check("① 尾页最后一条是 tool/call(ask_user_question)（计划批准也是这个工具）⇒ 1",
+		internals.liveTailRoleOf(tailAsk) === "ask",
+		`role=${internals.liveTailRoleOf(tailAsk)}`);
+	check("② 同一个 callId 之后有 tool/result ⇒ 已结算，0",
+		internals.liveTailRoleOf(tailAskSettled) === ""
+		&& internals.liveTailRoleOf([...tailAsk, { type: "event", event: { type: "tool/result", seq: 23, data: { toolCallId: "call_00_其他" } } }]) === "ask",
+		`settled=${internals.liveTailRoleOf(tailAskSettled)}`);
+	check("③ 尾页有 approval/asked、之后没有 approval/decided ⇒ 1（结算事件名确认：官方 SessionEventMap 里就是 approval/decided）",
+		internals.liveTailRoleOf(tailApproval) === "approval",
+		`role=${internals.liveTailRoleOf(tailApproval)}`);
+	check("④ approval/asked 之后有 approval/decided（outcome=allowed-once / rejected / cancelled / unavailable 都算结算）⇒ 0",
+		internals.liveTailRoleOf(tailApprovalSettled) === ""
+		&& internals.liveTailRoleOf([...tailApproval, { type: "event", event: { type: "approval/decided", seq: 35, data: { id: "d53feaa0-x", outcome: "rejected" } } }]) === "",
+		`settled=${internals.liveTailRoleOf(tailApprovalSettled)}`);
+	check("⑤ 别的 id 的 approval/decided **不能**顶掉这一条的待批（按 id 配对，不是按「有没有出现过 decided」）",
+		internals.liveTailRoleOf([...tailApproval, { type: "event", event: { type: "approval/decided", seq: 33, data: { id: "另一个-id", outcome: "allowed-once" } } }]) === "approval");
+	check("⑥ 形状不认识 / 空尾页 / 记账事件收尾 ⇒ 一律 0（宁可不画琥珀，也绝不瞎画）",
+		internals.liveTailRoleOf([]) === ""
+		&& internals.liveTailRoleOf(null) === ""
+		&& internals.liveTailRoleOf([{ type: "event", event: { type: "tool/call", seq: 1, data: { name: "write" } } }]) === ""
+		&& internals.liveTailRoleOf([{ type: "event", event: { type: "step/end", seq: 22 } }]) === ""
+		&& internals.liveTailRoleOf([{ nonsense: true }]) === "");
+
+	// 接上一条真实的轮询：controller 换成 pendingStub，走 pollLocalLive（宿主半每 5 秒那条路）。
+	// 注意两个落点：`state.controller` 是 `list()` 读的那份（`ctx.inject` 时写进去的），
+	// `runtime.sessionController` 是琥珀判定（`projections`/`page`）读的那份。
+	rt.sessionController = pendingStub;
+	internals.liveStateOf(rt).controller = pendingStub;
+	/**
+	 * 跑一轮 pollLocalLive。
+	 * `records` 既可以是"每条被读的会话都给同一份尾页"的数组，也可以是 `{ sessionId: records }`
+	 * 的映射（多条会话各自不同尾巴时用）；没给的会话给空尾页（= 不卡住）。
+	 */
+	const pollNow = async (items, records) => {
+		pendingStub.items = items;
+		const byId = Array.isArray(records)
+			? Object.fromEntries(items.map((item) => [item.sessionId, records]))
+			: (records === undefined ? {} : records);
+		pendingStub.recordsFor = (sessionId) => (byId[sessionId] === undefined ? [] : byId[sessionId]);
+		await internals.pollLocalLive(rt);
+		return pendingNow();
+	};
+	check("⑦ 提问卡：一条 running 会话尾页是不结算的 ask_user_question ⇒ pending=1，且 projections/page 各调一次、都带 throughSeq=asOfSeq",
+		(await pollNow([{ sessionId: "s-1", running: true }], tailAsk)) === 1
+		&& pendingStub.projectionsCalls === 1 && pendingStub.pageCalls === 1,
+		`pending=${String(pendingNow())} projections=${String(pendingStub.projectionsCalls)} page=${String(pendingStub.pageCalls)}`);
+	check("⑧ 同一会话结算（tool/result 跟上）⇒ pending 归 0",
+		(await pollNow([{ sessionId: "s-1", running: true }], tailAskSettled)) === 0, String(pendingNow()));
+	check("⑨ 三张卡同时开着（提问 + 多选 + 审批）=3 条 running 各自卡住 + 1 条在跑的对话 ⇒ pending=3（不是 4、也不是提问条数）",
+		(await pollNow([
+			{ sessionId: "s-ask", running: true },
+			{ sessionId: "s-multi", running: true },
+			{ sessionId: "s-approval", running: true },
+			{ sessionId: "s-chat", running: true },
+		], {
+			"s-ask": tailAsk,
+			"s-multi": tailAsk,
+			"s-approval": tailApproval,
+			"s-chat": [{ type: "event", event: { type: "assistant/message", seq: 40, data: {} } }],
+		})) === 3, String(pendingNow()));
+	check("⑩ 审批卡：尾页 approval/asked（未结算）⇒ 1；结算后 ⇒ 0",
+		(await pollNow([{ sessionId: "s-approval", running: true }], tailApproval)) === 1
+		&& (await pollNow([{ sessionId: "s-approval", running: true }], tailApprovalSettled)) === 0,
+		String(pendingNow()));
+	check("⑪ page() 抛错 ⇒ 这一条贡献 0（**绝不抛**，pollLocalLive 也不炸）",
+		(await (async () => {
+			pendingStub.pageError = true;
+			try {
+				await pollNow([{ sessionId: "s-boom", running: true }], tailAsk);
+			} catch (error) {
+				return `抛了：${String(error)}`;
+			} finally {
+				pendingStub.pageError = false;
+			}
+			return String(pendingNow());
+		})()) === "0",
+		`pending=${String(pendingNow())}`);
+	check("⑫ 形状不对（没有 projections/page 这个方法）⇒ 0，而且根本不调它们",
+		(await (async () => {
+			const before = [pendingStub.projectionsCalls, pendingStub.pageCalls];
+			rt.sessionController = { list: pendingStub.list.bind(pendingStub) };
+			pendingStub.items = [{ sessionId: "s-nope", running: true }];
+			await internals.pollLocalLive(rt);
+			const after = [pendingStub.projectionsCalls, pendingStub.pageCalls];
+			rt.sessionController = pendingStub;
+			return JSON.stringify([pendingNow(), after[0] - before[0], after[1] - before[1]]);
+		})()) === JSON.stringify([0, 0, 0]),
+		`pending=${String(pendingNow())}`);
+	check("⑬ **没有 running 会话时不调用 page**（123 条空闲会话也一样：一条尾页都不读）",
+		(await (async () => {
+			const beforePage = pendingStub.pageCalls;
+			const beforeProjections = pendingStub.projectionsCalls;
+			const idle = [];
+			for (let index = 0; index < 123; index += 1) idle.push({ sessionId: `s-idle-${String(index)}`, running: false });
+			const value = await pollNow(idle, tailAsk);
+			return JSON.stringify([value, pendingStub.pageCalls - beforePage, pendingStub.projectionsCalls - beforeProjections]);
+		})()) === JSON.stringify([0, 0, 0]),
+		`page=${String(pendingStub.pageCalls)} projections=${String(pendingStub.projectionsCalls)}`);
+	check("⑭ list() 抛错 ⇒ 只记一次日志、保持上一轮数值、**上面那层绝不抛**",
+		(await (async () => {
+			pendingStub.listError = true;
+			try {
+				await internals.pollLocalLive(rt);
+			} catch (error) {
+				return `抛了：${String(error)}`;
+			} finally {
+				pendingStub.listError = false;
+			}
+			return String(internals.liveStateOf(rt).pending);
+		})()) === "0" && internals.LIVE_TAIL_N >= 8,
+		`LIVE_TAIL_N=${String(internals.LIVE_TAIL_N)}`);
+	check("⑮ 同一条会话持续卡住 ⇒ 日志**不重复**；换了一条卡住的会话才再写一条（只在结果变化时写）",
+		(await (async () => {
+			await pollNow([{ sessionId: "s-log-1", running: true }], tailAsk);
+			const logsAfterFirst = liveRouter.logs.filter((line) => line.includes("琥珀亮）：s-log-1")).length;
+			await pollNow([{ sessionId: "s-log-1", running: true }], tailAsk);
+			const logsAfterSame = liveRouter.logs.filter((line) => line.includes("琥珀亮）：s-log-1")).length;
+			await pollNow([{ sessionId: "s-log-2", running: true }], tailAsk);
+			const logsAfterOther = liveRouter.logs.filter((line) => line.includes("琥珀亮）：s-log-1")).length
+				+ liveRouter.logs.filter((line) => line.includes("琥珀亮）：s-log-2")).length;
+			return JSON.stringify([logsAfterFirst, logsAfterSame, logsAfterOther]);
+		})()) === JSON.stringify([1, 1, 2]),
+		`logs=${JSON.stringify(liveRouter.logs.filter((line) => line.includes("琥珀")).slice(-6))}`);
+
+	section("L4 POST /plugin/remote/live/seen：本机/对端分支与 405/400/仅回环边界");
+	const armUnread = async () => {
+		liveItems.value = [{ running: true }];
+		await sleep(160);
+		liveItems.value = [{ running: false }];
+		await sleep(160);
+		return (await selfLiveNow()).unread === true;
+	};
+	check("准备：再点亮一次（>0 → 0）", (await armUnread()) === true);
+	const seenEmpty = await httpJson(`${liveBase}/live/seen`, { method: "POST" });
+	notHtml("POST /plugin/remote/live/seen（body 缺省）", seenEmpty);
+	check("body 缺省（= 本机）→ 清本机 unread，且**返回同形状的最新聚合**",
+		seenEmpty.status === 200
+		&& JSON.stringify(Object.keys(seenEmpty.json).sort()) === JSON.stringify(["at", "peers", "self"])
+		&& seenEmpty.json.self.live.unread === false
+		&& readJsonFile(liveFile).unread === false,
+		JSON.stringify(seenEmpty.json?.self));
+	check("准备：再点亮一次（给 id=本机设备 id 的分支用）", (await armUnread()) === true);
+	const seenLocalId = await httpJson(`${liveBase}/live/seen`, { method: "POST", body: { id: "me" } });
+	check("id = 被认领为本机那条设备的 id → 走**本机**分支（清本机 unread）",
+		seenLocalId.json?.self?.live?.unread === false, JSON.stringify(seenLocalId.json?.self));
+	check("准备：再点亮一次（给未知 id 分支用）", (await armUnread()) === true);
+	const seenGhost = await httpJson(`${liveBase}/live/seen`, { method: "POST", body: { id: "ghost" } });
+	check("id 未知 → 也按本机处理（客户端半不必知道本机到底认领了哪条设备）",
+		seenGhost.json?.self?.live?.unread === false, JSON.stringify(seenGhost.json?.self));
+	check("准备：再点亮一次（给对端分支用）", (await armUnread()) === true);
+	const liveUpSeenBefore = liveUp.calls.seen;
+	const seenPeer = await httpJson(`${liveBase}/live/seen`, { method: "POST", body: { id: "up" } });
+	const peerUpAfterSeen = (seenPeer.json?.peers ?? []).find((peer) => peer.id === "up");
+	check("id = 对端 → **不**清本机 unread，改成 POST 对端的 /dsh-remote-live/seen",
+		seenPeer.status === 200 && liveUp.calls.seen === liveUpSeenBefore + 1
+		&& seenPeer.json?.self?.live?.unread === true,
+		`seenCalls=${String(liveUp.calls.seen)} self=${JSON.stringify(seenPeer.json?.self?.live)}`);
+	check("对端清完的 live 立刻进聚合（peers[].live.unread=false）",
+		peerUpAfterSeen?.reachable === true && peerUpAfterSeen?.live?.unread === false,
+		JSON.stringify(peerUpAfterSeen));
+	check("转发给对端的路径就是 /dsh-remote-live/seen（POST）",
+		liveUp.calls.paths.includes(internals.PEER_LIVE_SEEN_PATH)
+		&& liveUp.calls.methods[liveUp.calls.paths.indexOf(internals.PEER_LIVE_SEEN_PATH)] === "POST",
+		JSON.stringify([...new Set(liveUp.calls.paths)]));
+	const seenMineAgain = await httpJson(`${liveBase}/live/seen`, { method: "POST", body: { id: "" } });
+	check("id = 空串 → 本机分支（把本机 unread 清掉）",
+		seenMineAgain.json?.self?.live?.unread === false, JSON.stringify(seenMineAgain.json?.self?.live));
+	const liveGet405 = await httpJson(`${liveBase}/live`, { method: "POST", body: {} });
+	check("POST /plugin/remote/live → 405（读取只认 GET/HEAD）", liveGet405.status === 405, String(liveGet405.status));
+	notHtml("POST /plugin/remote/live（405）", liveGet405);
+	const liveSeenBadBody = await httpJson(`${liveBase}/live/seen`, {
+		method: "POST",
+		body: "{not json",
+		headers: { "content-type": "application/json" },
+	});
+	check("POST /plugin/remote/live/seen 收到非法 JSON → 400（不是 500、不是 HTML）",
+		liveSeenBadBody.status === 400, `${String(liveSeenBadBody.status)} ${JSON.stringify(liveSeenBadBody.body.slice(0, 60))}`);
+	notHtml("POST /plugin/remote/live/seen（400）", liveSeenBadBody);
+	const liveRemote = await localExchange(liveRouter, { url: internals.LIVE_PATH, remoteAddress: "192.0.2.9" });
+	check("本机页面口从非回环打 → 403 loopback only（与 /plugin/remote/state 同一道守卫）",
+		liveRemote.status === 403 && liveRemote.body.includes("loopback only"),
+		`${String(liveRemote.status)} ${JSON.stringify(liveRemote.body.slice(0, 60))}`);
+	const liveLoop = await localExchange(liveRouter, { url: internals.LIVE_PATH });
+	check("本机页面口从回环打 → 200 且是同一份聚合（直接走 handler 也对）",
+		liveLoop.status === 200 && JSON.parse(liveLoop.body).peers.length === 3, JSON.stringify(liveLoop.body).slice(0, 100));
+
+	section("L5 fetchPeerPath：probeDevice 的泛化（path/method/body、限长、超时、网络错）");
+	const miniRuntime = {
+		ctx: { logger: { warn() {}, info() {}, error() {} } },
+		sessions: new Map(),
+		sessionStore: undefined,
+		authFailures: new Map(),
+		tokenCache: new Map(),
+		tokens: { get: async () => undefined },
+		reach: new Map(),
+	};
+	const liveDeviceOf = (port) => ({
+		id: `peer-${String(port)}`,
+		name: "对端",
+		protocol: "http:",
+		hostname: "127.0.0.1",
+		port: String(port),
+		authority: `127.0.0.1:${String(port)}`,
+		origin: `http://127.0.0.1:${String(port)}`,
+		basePath: "",
+		rawUrl: `http://127.0.0.1:${String(port)}`,
+	});
+	const directPeer = await startFakeLivePeer();
+	const directOk = await internals.fetchPeerPath(miniRuntime, liveDeviceOf(directPeer.port), internals.PEER_LIVE_PATH);
+	check("拿到 200 → status=200、ok=true、响应体被保留并 JSON.parse 成 json，可达性记进 markReach",
+		directOk.status === 200 && directOk.ok === true && directOk.json?.live?.running === 2
+		&& miniRuntime.reach.get(`peer-${String(directPeer.port)}`)?.reachable === true,
+		JSON.stringify([directOk.status, directOk.json]));
+	const directOld = await startFakeLivePeer({ status: 404 });
+	const direct404 = await internals.fetchPeerPath(miniRuntime, liveDeviceOf(directOld.port), internals.PEER_LIVE_PATH);
+	check("拿到 404 → ok=true、status=404、json=null（**这不算网络错误**）",
+		direct404.ok === true && direct404.status === 404 && direct404.json === null,
+		JSON.stringify([direct404.ok, direct404.status]));
+	const directDead = await internals.fetchPeerPath(miniRuntime, liveDeviceOf(await freeDeadPort()), internals.PEER_LIVE_PATH, { timeoutMs: 1500 });
+	check("连接失败 → status=null（**只有这种才是不可达**）、error 有内容",
+		directDead.status === null && directDead.ok === false && typeof directDead.error === "string" && directDead.error.length > 0,
+		JSON.stringify([directDead.status, directDead.error]));
+	const blackhole = createServer(() => { /* 连上但永不响应 */ });
+	await new Promise((resolve) => blackhole.listen(0, "127.0.0.1", resolve));
+	const blackholePort = blackhole.address().port;
+	const directTimeout = await internals.fetchPeerPath(miniRuntime, liveDeviceOf(blackholePort), internals.PEER_LIVE_PATH, { timeoutMs: 150 });
+	await new Promise((resolve) => blackhole.close(resolve));
+	check("超时（对端连上但不回一个字节）→ status=null、error 写明连接超时（超时可按需覆盖）",
+		directTimeout.status === null && String(directTimeout.error).includes("连接超时"),
+		JSON.stringify([directTimeout.status, directTimeout.error]));
+	check("缺省超时 = PEER_LIVE_TIMEOUT_MS（1.5 秒）且**小于**轮询间隔 2 秒（不会拖住下一轮）",
+		internals.PEER_LIVE_TIMEOUT_MS === 1_500 && internals.PEER_LIVE_TIMEOUT_MS < internals.LIVE_POLL_MS,
+		`${String(internals.PEER_LIVE_TIMEOUT_MS)} / ${String(internals.LIVE_POLL_MS)}`);
+	const huge = createServer((req, res) => {
+		req.resume();
+		req.on("end", () => {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(`{"live":{"running":1,"padding":"${"x".repeat(4096)}"}}`);
+		});
+	});
+	await new Promise((resolve) => huge.listen(0, "127.0.0.1", resolve));
+	const hugePort = huge.address().port;
+	const limited = await internals.fetchPeerPath(miniRuntime, liveDeviceOf(hugePort), internals.PEER_LIVE_PATH, { maxBytes: 64 });
+	await new Promise((resolve) => huge.close(resolve));
+	check("限长：超过 maxBytes 立刻截断（truncated=true、字节数不超过上限），且**不当成网络错误**",
+		limited.status === 200 && limited.truncated === true && Buffer.byteLength(limited.body ?? "", "utf8") <= 64,
+		`truncated=${String(limited.truncated)} bytes=${String(Buffer.byteLength(limited.body ?? "", "utf8"))}`);
+	check("缺省限长 = PEER_LIVE_MAX_BYTES（16 KiB：只留一段 JSON 体，绝不把大响应读进内存）",
+		internals.PEER_LIVE_MAX_BYTES === 16 * 1024, String(internals.PEER_LIVE_MAX_BYTES));
+	await directPeer.close();
+	await directOld.close();
+	check("liveViewFromPeerBody：404 / 非 JSON / 形状不对一律 null（页面就不画点）",
+		internals.liveViewFromPeerBody({ status: 404, json: null }) === null
+		&& internals.liveViewFromPeerBody({ status: 200, json: null }) === null
+		&& internals.liveViewFromPeerBody({ status: 200, json: { live: null } }) === null
+		&& internals.liveViewFromPeerBody({ status: 200, json: { live: "x" } }) === null);
+	check("liveViewFromPeerBody：200 + 合法 live → 逐字段清洗（缺字段/错类型当 0/false）",
+		JSON.stringify(internals.liveViewFromPeerBody({ status: 200, json: { live: { running: "3", pending: -1, unread: 1, doneAt: 5.9, at: null } } }))
+		=== JSON.stringify({ running: 3, pending: 0, unread: false, doneAt: 5, at: 0 }));
+	check("liveSelfNameOf / buildLiveAggregate.self：认领到本机设备 ⇒ 它的名字；没认领到 / 名字是脏的 ⇒ 空串（客户端半退回「本机」）",
+		internals.liveSelfNameOf({ localDevice: { id: "me", name: "公司台" } }) === "公司台"
+		&& internals.liveSelfNameOf({ localDevice: { id: "me", name: "  公司台  " } }) === "公司台"
+		&& internals.liveSelfNameOf({ localDevice: { id: "me", name: 42 } }) === ""
+		&& internals.liveSelfNameOf({}) === ""
+		&& internals.liveSelfNameOf(null) === "");
+	const aggregateSelf = internals.buildLiveAggregate({
+		localDevice: { id: "me", name: "公司台" },
+		live: internals.createLiveState(),
+		devices: [],
+	}).self;
+	check("buildLiveAggregate：self 就是 {name, live} 两个键，peers[] 一个字节都没多（老客户端半照样认）",
+		JSON.stringify(Object.keys(aggregateSelf).sort()) === JSON.stringify(["live", "name"])
+		&& aggregateSelf.name === "公司台"
+		&& JSON.stringify(Object.keys(aggregateSelf.live).sort()) === JSON.stringify(["at", "doneAt", "pending", "running", "unread"]),
+		JSON.stringify(aggregateSelf));
+	const liveNoDevice = JSON.parse(liveResp.body);
+	check("这台机器上 URL 自验证没命中（测试里设备写的是 127.0.0.1:9）、但回退 `current` 认领了 \"me\" ⇒ self.name 就是那条设备的名字（真机 auto 分支的「公司台」是同一个字段）",
+		liveNoDevice.self.name === "本机台", JSON.stringify(liveNoDevice.self));	await liveUp.close();
+	await liveOld.close();
+	await liveHost.close();
 
 	const failed = checks.filter((entry) => !entry.ok);
 	log(`\n=== 结果：${String(checks.length - failed.length)}/${String(checks.length)} 通过 ===`);

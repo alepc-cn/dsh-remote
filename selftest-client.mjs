@@ -578,6 +578,10 @@ function createSandbox(options = {}) {
 		pendingEffects: [],
 		clipboardWrites: [],
 		settingsSections: [],
+		/** 全部注册（带槽名）：目录流接管那两项也在这里，settingsSections 只留设置页那项。 */
+		registrations: [],
+		/** uiWorkspace 替身的调用记录（list / create / pick）。 */
+		uiWorkspaceCalls: [],
 		requireCalls: [],
 		reloads: 0,
 		/** `location.assign` 的调用记录（功能 1「另存为…」就是靠它跳转）。 */
@@ -714,23 +718,67 @@ function createSandbox(options = {}) {
 		return sandbox.moduleExports;
 	};
 
-	/** 用假 ctx.slots 跑一遍 apply，返回注册记录。 */
+	/** 用假 ctx.slots 跑一遍 apply，返回设置页那项注册（其余注册在 sandbox.registrations 里）。 */
 	sandbox.applyModule = () => {
 		const ctx = {
+			uiWorkspace: sandbox.uiWorkspace,
+			sessions: sandbox.sessions,
 			slots: {
 				inject(slotName, register) {
 					Array.prototype.push.call(sandbox.log, { op: "inject", slotName });
-					// 任务书要求：宿主立刻执行这个回调。
-					return register();
+					// 任务书要求：宿主立刻执行这个回调。顺带记住"现在是哪个洞"，
+					// 因为 register 只收到 options.name，而我们要按**洞名**把注册分类。
+					const previous = sandbox.currentSlot;
+					sandbox.currentSlot = slotName;
+					try {
+						return register();
+					} finally {
+						sandbox.currentSlot = previous;
+					}
 				},
 				register(options_, component) {
-					sandbox.settingsSections.push({ options: options_, component });
+					const slotName = sandbox.currentSlot === undefined ? "" : sandbox.currentSlot;
+					const entry = { slotName, options: options_, component };
+					Array.prototype.push.call(sandbox.registrations, entry);
+					if (slotName === "settings.section") Array.prototype.push.call(sandbox.settingsSections, entry);
 					return { dispose() {} };
 				},
 			},
 		};
 		sandbox.moduleExports.apply(ctx);
-		return sandbox.settingsSections;
+		return sandbox.registrations;
+	};
+
+	/**
+	 * 目录流占据方依赖的 `uiWorkspace` 替身（只有远端模式接管后才会被调用）。
+	 * 行为由 `createSandbox({ directory: { list, create, pick } })` 注入：
+	 * 三个入口各自返回 `Promise.resolve(handler(...))`，没配就 reject（测试里能看出"没接管却调了"）。
+	 */
+	/**
+	 * 客户端会话服务替身（目录流拿它当"对面已有工作区目录"的候选来源）。
+	 * 形状照官方：`sessions.list.getSnapshot()` → `{ byId: { [id]: { cwd } } }`。
+	 */
+	sandbox.sessions = options.sessions === undefined ? { list: { getSnapshot: () => ({ byId: {} }) } } : options.sessions;
+
+	sandbox.uiWorkspace = {
+		listDirectory(path, signal) {
+			Array.prototype.push.call(sandbox.uiWorkspaceCalls, { op: "list", path: path === undefined ? "" : String(path) });
+			const handler = options.directory === undefined ? undefined : options.directory.list;
+			if (typeof handler === "function") return Promise.resolve(handler(path, signal));
+			return Promise.reject(new Error("uiWorkspace.listDirectory 没有配置替身"));
+		},
+		createDirectory(path, name) {
+			Array.prototype.push.call(sandbox.uiWorkspaceCalls, { op: "create", path: String(path), name: String(name) });
+			const handler = options.directory === undefined ? undefined : options.directory.create;
+			if (typeof handler === "function") return Promise.resolve(handler(path, name));
+			return Promise.reject(new Error("uiWorkspace.createDirectory 没有配置替身"));
+		},
+		pickDirectory() {
+			Array.prototype.push.call(sandbox.uiWorkspaceCalls, { op: "pick", path: "" });
+			const handler = options.directory === undefined ? undefined : options.directory.pick;
+			if (typeof handler === "function") return Promise.resolve(handler());
+			return Promise.reject(new Error("uiWorkspace.pickDirectory 没有配置替身"));
+		},
 	};
 
 	/**
@@ -898,9 +946,9 @@ check("label 是「远程连接」，order = 60，id 是非空字符串", () => 
 	assert(SECTIONS[0].options.id !== "", "id 不能是空串");
 });
 
-check("源码里只 register 三次（设置页 + 两个菜单项）；旧的三页 id 与标签都已清掉", () => {
-	assertEqual((SOURCE.match(/ctx\.slots\.register\(/g) || []).length, 3, "register 调用次数");
-	assertEqual((SOURCE.match(/ctx\.slots\.inject\(/g) || []).length, 3, "inject 调用次数");
+check("源码里只 register 五次（设置页 + 两个菜单项 + 两个目录流洞）；旧的三页 id 与标签都已清掉", () => {
+	assertEqual((SOURCE.match(/ctx\.slots\.register\(/g) || []).length, 5, "register 调用次数");
+	assertEqual((SOURCE.match(/ctx\.slots\.inject\(/g) || []).length, 5, "inject 调用次数（3 个功能位 + 两个目录流洞）");
 	for (const oldId of ["remote-access", "remote-devices", "remote-health"]) {
 		assert(!SOURCE.includes(`"${oldId}"`), `旧的三页 id 不该还在：${oldId}`);
 	}
@@ -1749,6 +1797,10 @@ function menuSandbox(options = {}) {
 		responses: options.responses === undefined ? {} : options.responses,
 		// `primitives: true` = require 拿到有 Button/MenuItemButton/图标的假 ui-primitives。
 		primitives: options.primitives === true,
+		// 目录流占据方用的 uiWorkspace 替身（功能 3 的用例才给）。
+		directory: options.directory,
+		// 「对面已有工作区目录」的候选来源（功能 3 的用例才给）。
+		sessions: options.sessions,
 	});
 	if (options.current !== undefined && options.current !== "") sandbox.localStorage.setItem("dsh-device-switch:current", options.current);
 	sandbox.loadModule();
@@ -2219,7 +2271,7 @@ check("形态是构建产物格式：window.__ModuleLoader__.load 包住 factory
 	assert(/window\.__ModuleLoader__\.load\(\{/.test(SOURCE), "必须是 __ModuleLoader__.load({...}) 形态");
 	assert(SOURCE.includes('id: "@local/dsh-remote"'), "id 必须是 @local/dsh-remote");
 	assert(SOURCE.includes("factory: (require) => {"), "必须是 factory: (require) => {...}");
-	assert(SOURCE.includes('exports.inject = ["slots"]'), "必须导出 inject = [slots]");
+	assert(SOURCE.includes('exports.inject = ["slots", "uiWorkspace", "sessions"]'), '必须导出 inject = ["slots", "uiWorkspace", "sessions"]');
 	assert(SOURCE.includes("return module.exports;"), "必须 return module.exports");
 });
 
@@ -2236,6 +2288,576 @@ check("修复②：表单更新一律函数式 setForm(prev => ({ ...prev, ... }
 	assert(SOURCE.includes("setForm(function (previous) {"), "必须有函数式 setForm");
 	assert(SOURCE.includes("return { ...asObject(previous), ...patch };"), "patch 必须展开上一份状态");
 	assert((SOURCE.match(/setForm\(/g) || []).length >= 2, "至少有两处 setForm 调用（改字段 / 重置）");
+});
+
+//#endregion
+
+//#region 21. 功能 3：远端模式下接管「添加工作区…」的目录选择
+
+/**
+ * 两个「目录流」洞（ui-workspace 声明成 `single`）。官方占据方（-native 的无渲染驱动）
+ * 在 priority 0；我们在**远端模式**下用 -1 遮蔽它。
+ */
+const DIR_HOLES = ["conversation.hero.workspace.directoryFlow", "sidebar.workspaces.directoryFlow"];
+
+/** 远端模式的沙盒：localStorage 里选着一台设备 = 垫片正把 api 流量改道到那台机器。 */
+function dirFlowSandbox(options = {}) {
+	return menuSandbox({
+		current: options.current === undefined ? "device-b" : options.current,
+		directory: options.directory,
+		sessions: options.sessions,
+		responses: options.responses,
+	});
+}
+
+/** 对面机器（B）的家目录列表（官方 browse 后端的返回形状）。 */
+const HOME_LIST = {
+	path: "C:\\Users\\bob",
+	home: "C:\\Users\\bob",
+	crumbs: [
+		{ name: "C:\\", path: "C:\\", hidden: false },
+		{ name: "Users", path: "C:\\Users", hidden: false },
+		{ name: "bob", path: "C:\\Users\\bob", hidden: false },
+	],
+	entries: [
+		{ name: "dev", path: "C:\\Users\\bob\\dev", hidden: false },
+		{ name: "notes", path: "C:\\Users\\bob\\notes", hidden: false },
+	],
+	truncated: false,
+};
+
+/** 进入 dev 之后的列表。 */
+const DEV_LIST = {
+	path: "C:\\Users\\bob\\dev",
+	home: "C:\\Users\\bob",
+	crumbs: HOME_LIST.crumbs.concat([{ name: "dev", path: "C:\\Users\\bob\\dev", hidden: false }]),
+	entries: [{ name: "src", path: "C:\\Users\\bob\\dev\\src", hidden: false }],
+	truncated: false,
+};
+
+/**
+ * 取目录流占据方 + 一份"框架会传进来的 props"（注入的业务 share + owner 约定）。
+ * 注入那部分直接调注册项自己的 `inject()`，于是注入契约也被这条用例覆盖。
+ */
+function flowProps(sandbox, ownerOverrides = {}) {
+	const entry = slotEntry(sandbox, DIR_HOLES[1]);
+	const calls = { picked: [], cancelled: 0, errors: [] };
+	const props = Object.assign({}, entry.options.inject(), {
+		open: true,
+		busy: false,
+		onPicked(path) {
+			calls.picked.push(String(path));
+		},
+		onCancel() {
+			calls.cancelled += 1;
+		},
+		onError(message) {
+			calls.errors.push(String(message));
+		},
+	}, ownerOverrides);
+	return { component: entry.component, props, calls };
+}
+
+/**
+ * 首次加载目录流：**先渲染**（effect 才会发出请求）→ 等 promise → 再渲染，直到没有新的状态写入。
+ *
+ * 为什么不能直接用 `settleRenders`：它是"先 await 再 render"，冷启动那一轮请求还没发出就已经判定
+ * "没有新写入"并 break，返回的还是"读取中"。`renderLoaded` 同样先渲染，但它只再渲染一次，
+ * 而这条链是两段（列表 + 设备名），所以这里多转几轮直到稳定。
+ */
+async function loadFlow(sandbox, component, props) {
+	sandbox.render(component, props);
+	await settle();
+	let tree = sandbox.render(component, props).tree;
+	for (let round = 0; round < 4; round += 1) {
+		const before = sandbox.stateWrites.length;
+		await settle();
+		const result = sandbox.render(component, props);
+		tree = result.tree;
+		if (sandbox.stateWrites.length === before) break;
+	}
+	return tree;
+}
+
+check("本机模式**不接管**：两个目录流洞一个都不注册（官方占据方保持原样）", () => {
+	const sandbox = menuSandbox();
+	const entries = slotEntries(sandbox);
+	assert(
+		entries.every((row) => DIR_HOLES.indexOf(row.options.name) === -1),
+		`本机模式不许注册目录流：${JSON.stringify(entries.map((row) => row.options.name))}`,
+	);
+	let threw = 0;
+	for (const hole of DIR_HOLES) {
+		try {
+			slotEntry(sandbox, hole);
+		} catch (error) {
+			threw += 1;
+		}
+	}
+	assertEqual(threw, 2, "两个洞都必须没注册");
+	// 顺带守住：本机模式下连 inject 都不该发生（不打扰官方占据方）。
+	const injected = readArray(sandbox.log).filter((row) => row.op === "inject").map((row) => row.slotName);
+	assertEqual(JSON.stringify(injected), JSON.stringify(["settings.section", "sidebar.right.tab.document.actions", "sidebar.workspaces.session.menu.item"]), "本机模式的 inject 列表");
+});
+
+check("远端模式接管：两个洞各注册 1 项、priority = -1、同一个组件，且注册排在设置页之后", () => {
+	const sandbox = dirFlowSandbox();
+	const entries = slotEntries(sandbox);
+	assertEqual(entries[0].options.name, "settings.section", "设置页必须仍是第一项（本文件多处按 [0] 取它）");
+	const injected = readArray(sandbox.log).filter((row) => row.op === "inject").map((row) => row.slotName);
+	assertEqual(
+		JSON.stringify(injected),
+		JSON.stringify(["settings.section", "sidebar.right.tab.document.actions", "sidebar.workspaces.session.menu.item", DIR_HOLES[0], DIR_HOLES[1]]),
+		"接管发生在最后（两个洞各自 inject 一次）",
+	);
+	const heroes = entries.filter((row) => row.options.name === DIR_HOLES[0]);
+	const sidebars = entries.filter((row) => row.options.name === DIR_HOLES[1]);
+	assertEqual(heroes.length + sidebars.length, 2, "两个洞各 1 项");
+	assertEqual(heroes[0].options.priority, -1, `${DIR_HOLES[0]} 的 priority（-1 = 遮蔽官方那个 0）`);
+	assertEqual(sidebars[0].options.priority, -1, `${DIR_HOLES[1]} 的 priority`);
+	assertEqual(heroes[0].component, sidebars[0].component, "两个洞必须是同一支组件");
+	assertEqual(typeof heroes[0].component, "function", "组件类型");
+	assert(heroes[0].options.id === undefined, "single 洞不该带 id（那是 list 洞的字段）");
+});
+
+check("远端模式的业务注入：uiWorkspace 的 listDirectory / createDirectory / pickDirectory + 当前设备 id", () => {
+	const sandbox = dirFlowSandbox({ directory: { list: () => HOME_LIST } });
+	const entry = slotEntry(sandbox, DIR_HOLES[0]);
+	const injected = entry.options.inject();
+	assertEqual(typeof injected.listDirectory, "function", "listDirectory");
+	assertEqual(typeof injected.createDirectory, "function", "createDirectory");
+	assertEqual(typeof injected.pickDirectory, "function", "pickDirectory");
+	assertEqual(injected.deviceId, "device-b", "设备 id 必须来自 localStorage 的切换键");
+	// 注入的方法必须真的打到 uiWorkspace 上（远端模式下由垫片落到对面那台机器）。
+	return injected.listDirectory("C:\\Users\\bob", undefined).then(() => {
+		const calls = readArray(sandbox.uiWorkspaceCalls);
+		assertEqual(calls.length, 1, "uiWorkspace 调用数");
+		assertEqual(calls[0].op, "list", "调用必须是 list");
+		assertEqual(calls[0].path, "C:\\Users\\bob", "路径原样透传");
+	});
+});
+
+check("源码契约：接管被 isRemoteMode() 守住、priority 常量是 -1、两个洞名只出现一次注册", () => {
+	assert(SOURCE.includes("function registerDirectoryFlow(ctx) {"), "必须有 registerDirectoryFlow");
+	assert(SOURCE.includes("if (!isRemoteMode()) return;"), "本机模式必须直接返回（不注册、不打扰官方占据方）");
+	assert(SOURCE.includes("var DIR_FLOW_PRIORITY = -1;"), "优先级常量必须是 -1");
+	assert(SOURCE.includes("priority: DIR_FLOW_PRIORITY"), "register 必须带上那个优先级");
+	assert(SOURCE.includes('exports.inject = ["slots", "uiWorkspace", "sessions"]'), "必须注入 uiWorkspace（目录浏览）与 sessions（对面已有工作区目录）");
+	assert(SOURCE.includes("registerDirectoryFlow(ctx);"), "apply 必须调用它");
+	const menuAt = SOURCE.lastIndexOf('ctx.slots.inject("sidebar.workspaces.session.menu.item"');
+	assert(SOURCE.indexOf("registerDirectoryFlow(ctx);") > menuAt, "接管必须在设置页与两个功能位之后（apply 的最后）");
+	assert(SOURCE.includes("远端目录流接管失败"), "接管必须包在 try/catch 里：注册失败不许连累设置页与菜单项");
+	// 只用 useState/useEffect：假 react 对 useRef/useMemo/useCallback 直接抛错，这里再加一道文本闸。
+	for (const forbidden of ["react.useRef", "react.useMemo", "react.useCallback"]) {
+		assert(!SOURCE.includes(forbidden), `不许用 ${forbidden}（客户端半只承诺 useState/useEffect）`);
+	}
+});
+
+check("open=false 时目录流渲染 null（不占位、不请求）", () => {
+	const sandbox = dirFlowSandbox({ directory: { list: () => HOME_LIST } });
+	const { component, props } = flowProps(sandbox, { open: false });
+	const result = sandbox.render(component, props);
+	assertEqual(result.tree, null, "关着的时候必须渲染 null");
+	assertEqual(readArray(sandbox.uiWorkspaceCalls).length, 0, "关着的时候一个请求都不许发");
+});
+
+check("open=true：先列对面机器的**家目录**（path 缺省），把子目录渲染成可点行，且不白屏", async () => {
+	const sandbox = dirFlowSandbox({
+		directory: { list: (path) => (path === undefined ? HOME_LIST : DEV_LIST) },
+		responses: { "/plugin/remote/state": { devices: [{ id: "device-b", name: "设备B" }] } },
+	});
+	const { component, props } = flowProps(sandbox);
+	const tree = await loadFlow(sandbox, component, props);
+	const calls = readArray(sandbox.uiWorkspaceCalls);
+	assertEqual(calls.length, 1, `只该请求一次（effect 重复跑也要幂等）：${JSON.stringify(calls)}`);
+	assertEqual(calls[0].op, "list", "第一次调用");
+	assertEqual(calls[0].path, "", "第一次列的是缺省路径（= 对面的家目录）");
+	const text = flatText(tree);
+	assert(text.includes("设备B"), `标题必须用宿主半设备表里的名字：${text}`);
+	assert(text.includes("不是本机"), `必须写明这是对面机器：${text}`);
+	assert(text.includes("dev") && text.includes("notes"), `必须列出子目录：${text}`);
+	assert(text.includes("C:\\Users\\bob"), `必须显示当前路径：${text}`);
+	assert(findButton(tree, "用这个目录") !== undefined, "必须能提交当前目录");
+	assert(findButton(tree, "取消") !== undefined, "必须能取消");
+});
+
+check("进子目录 / 上一层 / 面包屑：按对应绝对路径再列一次（对面那台机器上的路径）", async () => {
+	const sandbox = dirFlowSandbox({ directory: { list: (path) => (path === "C:\\Users\\bob\\dev" ? DEV_LIST : HOME_LIST) } });
+	const { component, props } = flowProps(sandbox);
+	const first = { tree: await loadFlow(sandbox, component, props) };
+	findButton(first.tree, "dev").props.onClick({ target: findButton(first.tree, "dev") });
+	const second = { tree: await loadFlow(sandbox, component, props) };
+	const calls = readArray(sandbox.uiWorkspaceCalls);
+	assertEqual(calls.length, 2, "进目录只该再列一次");
+	assertEqual(calls[1].path, "C:\\Users\\bob\\dev", "必须按那台的绝对路径列");
+	assert(flatText(second.tree).includes("src"), `必须渲染 dev 下的内容：${flatText(second.tree)}`);
+	assert(flatText(second.tree).includes("C:\\Users\\bob\\dev"), "当前路径必须跟着走");
+	// 上一层回到 bob
+	findButton(second.tree, "上一层").props.onClick({ target: findButton(second.tree, "上一层") });
+	const third = { tree: await loadFlow(sandbox, component, props) };
+	const calls2 = readArray(sandbox.uiWorkspaceCalls);
+	assertEqual(calls2[2].path, "C:\\Users\\bob", "上一层必须回到父目录");
+	assert(flatText(third.tree).includes("notes"), "父目录的内容必须回来");
+});
+
+check("点「用这个目录」→ onPicked(当前绝对路径)；点「取消」→ onCancel()", async () => {
+	const sandbox = dirFlowSandbox({ directory: { list: () => HOME_LIST } });
+	const { component, props, calls } = flowProps(sandbox);
+	const tree = await loadFlow(sandbox, component, props);
+	findButton(tree, "用这个目录").props.onClick({ target: findButton(tree, "用这个目录") });
+	assertEqual(JSON.stringify(calls.picked), JSON.stringify(["C:\\Users\\bob"]), "onPicked 必须拿到对面的绝对路径");
+	assertEqual(calls.cancelled, 0, "提交时不该报取消");
+	const cancel = findButton(tree, "取消");
+	cancel.props.onClick({ target: cancel });
+	assertEqual(calls.cancelled, 1, "点取消必须报 onCancel");
+});
+
+check("对面是**系统对话框**后端（list 抛 directory-picker/unavailable）：不白屏，给原因 + 解释 + 兜底入口", async () => {
+	const unavailable = Object.assign(new Error("directoryPicker.list needs the browse capability; the composed picker serves \"native\""), {
+		rpcError: { code: "directory-picker/unavailable", message: "对面的目录选择器是系统对话框模式" },
+	});
+	const sandbox = dirFlowSandbox({
+		directory: { list: () => Promise.reject(unavailable), pick: () => "D:\\work" },
+	});
+	const { component, props, calls } = flowProps(sandbox);
+	const tree = await loadFlow(sandbox, component, props);
+	const text = flatText(tree);
+	assert(text.includes("读不到"), `必须显示失败（中文，不抛英文原文）：${text}`);
+	assert(text.includes("系统对话框"), `必须说清是「系统对话框」式选择：${text}`);
+	assert(!text.includes("needs the browse capability"), `不许把官方英文原文抛给用户：${text}`);
+	assert(findButton(tree, "用对面机器的系统选择器") !== undefined, "必须给兜底入口");
+	assert(findButton(tree, "重试") === undefined, "这种限制下「重试」必然同样结果，不该摆出来");
+	const pick = findButton(tree, "用对面机器的系统选择器");
+	pick.props.onClick({ target: pick });
+	await settle();
+	assertEqual(JSON.stringify(readArray(sandbox.uiWorkspaceCalls).map((row) => row.op)), JSON.stringify(["list", "pick"]), "兜底入口必须调 pickDirectory");
+	assertEqual(JSON.stringify(calls.picked), JSON.stringify(["D:\\work"]), "系统选择器选中的路径要交给 owner");
+	assertEqual(calls.errors.length, 0, "兜底成功时不该报 onError");
+});
+
+check("新建文件夹：createDirectory(当前目录, 名字) 成功后重新列当前目录", async () => {
+	const sandbox = dirFlowSandbox({
+		directory: {
+			list: () => HOME_LIST,
+			create: (path, name) => path + "\\" + name,
+		},
+	});
+	const { component, props } = flowProps(sandbox);
+	const first = { tree: await loadFlow(sandbox, component, props) };
+	const input = findAll(first.tree, (node) => node.type === "input")[0];
+	assert(input !== undefined, "必须有新文件夹名输入框");
+	input.props.onChange({ target: { value: "新项目" } });
+	const typed = sandbox.render(component, props);
+	const create = findButton(typed.tree, "新建文件夹");
+	assert(create !== undefined, "必须有「新建文件夹」按钮");
+	create.props.onClick({ target: create });
+	const after = { tree: await loadFlow(sandbox, component, props) };
+	const calls = readArray(sandbox.uiWorkspaceCalls);
+	assertEqual(JSON.stringify(calls.map((row) => row.op)), JSON.stringify(["list", "create", "list"]), "顺序必须是 列目录 → 建目录 → 重新列目录");
+	assertEqual(calls[1].path, "C:\\Users\\bob", "必须在对面那个目录下建");
+	assertEqual(calls[1].name, "新项目", "名字必须原样透传");
+	assertEqual(calls[2].path, "C:\\Users\\bob", "建完刷新的是当前目录");
+	assert(findButton(after.tree, "用这个目录") !== undefined, "建完列表与提交按钮必须还在（不是白屏）");
+	assertEqual(findAll(after.tree, (node) => node.type === "input")[0].props.value, "", "建完输入框必须清空");
+});
+
+check("新建文件夹失败：错误就地显示，对话框不消失、不冒泡成白屏", async () => {
+	const sandbox = dirFlowSandbox({
+		directory: {
+			list: () => HOME_LIST,
+			create: () => Promise.reject(Object.assign(new Error("boom"), { rpcError: { code: "directory-picker/exists", message: "同名目录已存在" } })),
+		},
+	});
+	const { component, props, calls } = flowProps(sandbox);
+	const first = { tree: await loadFlow(sandbox, component, props) };
+	findAll(first.tree, (node) => node.type === "input")[0].props.onChange({ target: { value: "dev" } });
+	sandbox.render(component, props);
+	findButton(sandbox.render(component, props).tree, "新建文件夹").props.onClick({ target: {} });
+	const after = { tree: await loadFlow(sandbox, component, props) };
+	assert(flatText(after.tree).includes("同名目录已存在"), `必须显示宿主半的原因：${flatText(after.tree)}`);
+	assert(findButton(after.tree, "用这个目录") !== undefined, "失败后列表与提交按钮必须还在");
+	assertEqual(calls.errors.length, 0, "就地显示，不许把 owner 拖下水");
+});
+
+check("owner 正在创建（busy=true）：提交按钮置灰并改文案，选中路径仍保留", async () => {
+	const sandbox = dirFlowSandbox({ directory: { list: () => HOME_LIST } });
+	const { component, props } = flowProps(sandbox, { busy: true });
+	const tree = await loadFlow(sandbox, component, props);
+	const submit = findButton(tree, "正在创建…");
+	assert(submit !== undefined, `busy 时按钮文案必须是「正在创建…」：${flatText(tree)}`);
+	assertEqual(submit.props.disabled, true, "busy 时必须禁用");
+});
+
+check("远端模式的设备名取不到时退化成 id（不空白、不编名字）", async () => {
+	const sandbox = dirFlowSandbox({ directory: { list: () => HOME_LIST } });
+	const { component, props } = flowProps(sandbox, { deviceId: "device-b" });
+	const tree = await loadFlow(sandbox, component, props);
+	assert(flatText(tree).includes("device-b"), `设备名取不到时必须显示 id：${flatText(tree)}`);
+});
+
+check("兜底①：对面是系统对话框后端（列不了目录）时，直接输入绝对路径也能把工作区建到对面", async () => {
+	const unavailable = Object.assign(new Error("needs the browse capability"), {
+		rpcError: { code: "directory-picker/unavailable", message: "对面是系统对话框模式" },
+	});
+	const sandbox = dirFlowSandbox({ directory: { list: () => Promise.reject(unavailable) } });
+	const { component, props, calls } = flowProps(sandbox);
+	const tree = await loadFlow(sandbox, component, props);
+	const inputs = findAll(tree, (node) => node.type === "input");
+	const manual = inputs[inputs.length - 1];
+	assert(manual !== undefined, "列不了目录时必须有「直接输入路径」的输入框");
+	assertEqual(manual.props.value, "", "初始为空");
+	assertEqual(findButton(tree, "用这个路径").props.disabled, true, "空输入时按钮必须禁用");
+	manual.props.onChange({ target: { value: "D:\\work\\项目" } });
+	const typed = sandbox.render(component, props).tree;
+	const button = findButton(typed, "用这个路径");
+	assertEqual(button.props.disabled, false, "填了路径就必须可用");
+	button.props.onClick({ target: button });
+	assertEqual(JSON.stringify(calls.picked), JSON.stringify(["D:\\work\\项目"]), "必须把输入的绝对路径交给 owner");
+});
+
+check("兜底②：能列目录时输入框同样在（多一条路），且 owner 忙时两处提交都禁用", async () => {
+	const sandbox = dirFlowSandbox({ directory: { list: () => HOME_LIST } });
+	const { component, props } = flowProps(sandbox, { busy: true });
+	const tree = await loadFlow(sandbox, component, props);
+	const inputs = findAll(tree, (node) => node.type === "input");
+	assert(inputs.length >= 2, `列表能出时必须同时有新文件夹名与路径输入框：${inputs.length}`);
+	const manual = inputs[inputs.length - 1];
+	manual.props.onChange({ target: { value: "D:\\work" } });
+	const typed = sandbox.render(component, props).tree;
+	const button = findButton(typed, "用这个路径");
+	assert(button !== undefined, "必须有「用这个路径」");
+	assertEqual(button.props.disabled, true, "owner 正在创建时必须禁用（不许重复提交）");
+	assertEqual(findButton(typed, "正在创建…").props.disabled, true, "「用这个目录」也必须禁用");
+});
+
+check("选中的是**本机自己**那一台（设备表里 local:true）→ 不列目录，交回官方系统对话框", async () => {
+	const sandbox = dirFlowSandbox({
+		current: "company",
+		directory: {
+			list: () => HOME_LIST,
+			pick: () => "C:\\Users\\me\\proj",
+		},
+		responses: { "/plugin/remote/state": { devices: [{ id: "company", name: "公司台", local: true }, { id: "device-b", name: "设备B", local: false }] } },
+	});
+	const { component, props, calls } = flowProps(sandbox, { deviceId: "company" });
+	const tree = await loadFlow(sandbox, component, props);
+	assertEqual(
+		JSON.stringify(readArray(sandbox.uiWorkspaceCalls).map((row) => row.op)),
+		JSON.stringify(["pick"]),
+		"必须只调 pick（那是本机系统文件夹窗口），不列目录、不给输入框",
+	);
+	assertEqual(JSON.stringify(calls.picked), JSON.stringify(["C:\\Users\\me\\proj"]), "系统对话框选中的路径交给 owner");
+	assertEqual(tree, null, "本机自己那一台：我们连自己的弹窗都不渲染（屏幕上只该有系统窗口）");
+});
+
+check("设备表读不到时按「对面」处理（不误判成本机、也不卡住）", async () => {
+	const sandbox = dirFlowSandbox({
+		current: "device-b",
+		directory: { list: () => HOME_LIST },
+		responses: { "/plugin/remote/state": "fail" },
+	});
+	const { component, props } = flowProps(sandbox);
+	const tree = await loadFlow(sandbox, component, props);
+	assertEqual(
+		JSON.stringify(readArray(sandbox.uiWorkspaceCalls).map((row) => row.op)),
+		JSON.stringify(["list"]),
+		"设备表挂了也必须照常列目录",
+	);
+	assert(flatText(tree).includes("dev"), `必须渲染出列表：${flatText(tree)}`);
+});
+
+check("兜底③：对面是系统对话框后端时给出**能点的候选目录**（来自对面已有工作区），点一下即选中", async () => {
+	const unavailable = Object.assign(new Error("needs the browse capability"), {
+		rpcError: { code: "directory-picker/unavailable", message: "directoryPicker.list needs the browse capability; the composed picker serves \"native\"" },
+	});
+	const sandbox = dirFlowSandbox({
+		directory: { list: () => Promise.reject(unavailable) },
+		sessions: {
+			list: {
+				getSnapshot: () => ({
+					byId: {
+						"s-1": { cwd: "D:\\work\\项目" },
+						"s-2": { cwd: "D:\\work\\项目" },
+						"s-3": { cwd: "C:\\Users\\98559\\Documents" },
+						"s-4": {},
+					},
+				}),
+			},
+		},
+	});
+	const { component, props, calls } = flowProps(sandbox);
+	const tree = await loadFlow(sandbox, component, props);
+	const text = flatText(tree);
+	// 英文原文不再上界面：换成中文说清限制。
+	assert(!text.includes("needs the browse capability"), `不许把官方英文原文抛给用户：${text}`);
+	assert(text.includes("读不到") && text.includes("系统对话框"), `必须用中文说清是什么限制：${text}`);
+	assert(text.includes("对面已有的工作区目录"), `必须给出候选目录这一节：${text}`);
+	assertEqual(readArray(sandbox.uiWorkspaceCalls).filter((row) => row.op === "list").length, 1, "列目录失败只该试一次");
+	// 候选去重（两条同 cwd 收成一条）、点一下就选中。
+	const candidate = findButton(tree, "D:\\work\\项目");
+	assert(candidate !== undefined, `候选目录必须能点：${text}`);
+	assertEqual(findAll(tree, (node) => node.type === "button" && flatText(node) === "D:\\work\\项目").length, 1, "同一个 cwd 只许出现一次");
+	candidate.props.onClick({ target: candidate });
+	assertEqual(JSON.stringify(calls.picked), JSON.stringify(["D:\\work\\项目"]), "点候选即 onPicked");
+	// "重试"在系统对话框后端下必然还是同样结果 → 不该摆一个按了没用的按钮。
+	assert(findButton(tree, "重试") === undefined, "系统对话框后端下不该有「重试」");
+	assert(findButton(tree, "用对面机器的系统选择器") !== undefined, "仍保留对面系统选择器这条兜底");
+});
+
+check("候选目录：会话服务取不到 / 没有 cwd 时安静为空（不炸、不影响输入框那条路）", async () => {
+	const unavailable = Object.assign(new Error("x"), { rpcError: { code: "directory-picker/unavailable", message: "native" } });
+	const sandbox = dirFlowSandbox({
+		directory: { list: () => Promise.reject(unavailable) },
+		sessions: {
+			list: {
+				getSnapshot: () => {
+					throw new Error("会话服务炸了");
+				},
+			},
+		},
+	});
+	const { component, props } = flowProps(sandbox);
+	const tree = await loadFlow(sandbox, component, props);
+	assert(!flatText(tree).includes("对面已有的工作区目录"), "取不到候选时不该出现空那一节");
+	assert(findButton(tree, "用这个路径") !== undefined, "输入框那条路必须照常");
+});
+
+check("候选目录：能列目录时也一起给（多点几下就能选，不用翻）", async () => {
+	const sandbox = dirFlowSandbox({
+		directory: { list: () => HOME_LIST },
+		sessions: { list: { getSnapshot: () => ({ byId: { "s-1": { cwd: "D:\\existing\\proj" } } }) } },
+	});
+	const { component, props, calls } = flowProps(sandbox);
+	const tree = await loadFlow(sandbox, component, props);
+	const candidate = findButton(tree, "D:\\existing\\proj");
+	assert(candidate !== undefined, `可浏览时也要给候选：${flatText(tree)}`);
+	assert(findButton(tree, "dev") !== undefined, "正常的目录列表也必须在（候选是加料，不是替换）");
+	candidate.props.onClick({ target: candidate });
+	assertEqual(JSON.stringify(calls.picked), JSON.stringify(["D:\\existing\\proj"]), "点候选即 onPicked");
+});
+
+//#endregion
+
+//#region 5. 垫片发布的设备表（浏览器场景；live 403 时列设备/切设备的唯一来源）
+
+section("5. 垫片发布的设备表：全局快照 > 隐藏 JSON 节点 > 胶囊面板；live 拿不到也照样列全并切换");
+
+/**
+ * 造一个"自测钩子开着"的沙箱：`__DSH_REMOTE_PANEL_TEST__ === true` 时 `lib/client.js` 会把
+ * `deviceList` / `pickDevice` 挂到 `exports.__panel` 上（生产页面里没有这个全局量）。
+ */
+function panelSandbox(options) {
+	const sandbox = createSandbox(options);
+	sandbox.__DSH_REMOTE_PANEL_TEST__ = true;
+	return sandbox;
+}
+
+/** 假的胶囊面板按钮（老的 `[data-device-id]` 那一路的兜底夹具）。 */
+function shimPillNode(id, name, current) {
+	return {
+		firstChild: { nodeType: 3, nodeValue: name },
+		textContent: name,
+		getAttribute(attribute) {
+			if (attribute === "data-device-id") return id;
+			if (attribute === "data-current") return current === true ? "1" : null;
+			return null;
+		},
+	};
+}
+
+/** 取一次设备表（客户端半内部就是它给浮层用）。 */
+function devicesOf(sandbox) {
+	const mod = sandbox.loadModule();
+	assert(mod.__panel !== undefined, "自测钩子没生效（__DSH_REMOTE_PANEL_TEST__）");
+	return readArray(mod.__panel.deviceList());
+}
+
+check("浏览器场景：垫片发布的**全局快照**被优先读到（本机空 id 在最前 + 两台对端都在，名字用发布里的）", () => {
+	const sandbox = panelSandbox();
+	sandbox.__DSH_REMOTE_DEVICES__ = [
+		{ id: "", name: "公司台", current: true },
+		{ id: "home", name: "家里台", current: false },
+		{ id: "office", name: "办公室台", current: false },
+	];
+	const list = devicesOf(sandbox);
+	assertEqual(list.length, 3, `设备表条数：${JSON.stringify(list.map((entry) => entry.id))}`);
+	assertEqual(list[0].id, "", "本机那条 id 必须是空串（垫片与切换键都靠它）");
+	assertEqual(list[0].local, true, "本机那条 local === true");
+	assertEqual(list[0].name, "本机", "拿不到宿主半 self.name 时本机那条仍显示「本机」");
+	assertEqual(JSON.stringify(list.map((entry) => entry.id)), JSON.stringify(["", "home", "office"]), "设备表顺序");
+	assertEqual(list[1].name, "家里台", "对端名字来自垫片发布");
+	assertEqual(list[2].name, "办公室台", "对端名字来自垫片发布");
+});
+
+check("`current` 以 localStorage 的 current 键为准（发布里说本机 current，但键选的是 home ⇒ home 才是当前那台）", () => {
+	const sandbox = panelSandbox();
+	sandbox.__DSH_REMOTE_DEVICES__ = [
+		{ id: "", name: "公司台", current: true },
+		{ id: "home", name: "家里台", current: false },
+	];
+	sandbox.localStorage.setItem("dsh-device-switch:current", "home");
+	const list = devicesOf(sandbox);
+	assertEqual(list[0].current, false, "本机那条不再是当前（键说的是 home）");
+	assertEqual(list[1].current, true, "home 那条才是当前（发布里的 current 只是参考值）");
+});
+
+check("全局没有时读**隐藏 JSON 节点** `#dsh-remote-devices`（DOM 兜底，扛全局被清）", () => {
+	const sandbox = panelSandbox();
+	const raw = JSON.stringify({ devices: [{ id: "", name: "公司台" }, { id: "home", name: "家里台" }] });
+	sandbox.document.getElementById = (id) => (id === "dsh-remote-devices" ? { textContent: raw } : null);
+	const list = devicesOf(sandbox);
+	assertEqual(list.length, 2, `设备表条数：${JSON.stringify(list.map((entry) => entry.id))}`);
+	assertEqual(JSON.stringify(list.map((entry) => entry.id)), JSON.stringify(["", "home"]), "设备表顺序");
+	assertEqual(list[1].name, "家里台", "名字来自 JSON 节点");
+});
+
+check("两者都没有时回退老的**胶囊面板** `[data-device-id]`（那段一行回退的代码不许被删）", () => {
+	const sandbox = panelSandbox();
+	sandbox.document.querySelectorAll = (selector) => (selector === "[data-device-id]"
+		? [shimPillNode("", "本机", true), shimPillNode("home", "家里台", false)]
+		: []);
+	const list = devicesOf(sandbox);
+	assertEqual(JSON.stringify(list.map((entry) => entry.id)), JSON.stringify(["", "home"]), "回退路线仍能读出设备");
+	assertEqual(list[1].name, "家里台", "名字来自胶囊按钮的文本");
+});
+
+check("优先级：全局快照**压过** JSON 节点（两份都在时以全局为准）", () => {
+	const sandbox = panelSandbox();
+	sandbox.__DSH_REMOTE_DEVICES__ = [{ id: "", name: "公司台" }, { id: "global-only", name: "全局那台" }];
+	sandbox.document.getElementById = () => ({
+		textContent: JSON.stringify({ devices: [{ id: "", name: "公司台" }, { id: "node-only", name: "节点那台" }] }),
+	});
+	const list = devicesOf(sandbox);
+	assertEqual(JSON.stringify(list.map((entry) => entry.id)), JSON.stringify(["", "global-only"]), "以全局快照为准");
+});
+
+check("名字拿不到就用 id（对端绝不留空）；坏形状（字符串 / null / 缺字段）安静退回「只有本机」，不抛", () => {
+	const sandbox = panelSandbox();
+	sandbox.__DSH_REMOTE_DEVICES__ = [{ id: "", name: "" }, { id: "home", name: "   " }];
+	const list = devicesOf(sandbox);
+	assertEqual(list[1].name, "home", "对端没名字就用 id");
+	assertEqual(list[0].name, "本机", "本机没名字就退回「本机」");
+
+	const broken = panelSandbox();
+	broken.__DSH_REMOTE_DEVICES__ = "nope";
+	const onlyLocal = devicesOf(broken);
+	assertEqual(onlyLocal.length, 1, "坏数据 ⇒ 只剩本机那条（不抛、不白屏）");
+	assertEqual(onlyLocal[0].id, "", "剩下的就是本机那条");
+});
+
+check("读垫片发布的设备表**不新增任何网络请求**（列设备是纯本地；live 403 也不会因此多打一枪）", () => {
+	const sandbox = panelSandbox();
+	sandbox.__DSH_REMOTE_DEVICES__ = [{ id: "", name: "公司台" }, { id: "home", name: "家里台" }];
+	const list = devicesOf(sandbox);
+	assertEqual(list.length, 2, "前置条件：读到了设备表");
+	assertEqual(readArray(sandbox.readFetch()).length, 0, `不该有任何请求：${JSON.stringify(readArray(sandbox.readFetch()).map((call) => call.url))}`);
+});
+
+check("源码层面：读的节点 id 与宿主半发布的一致，且三路兜底（全局 / 节点 / 胶囊）都在", () => {
+	assert(SOURCE.includes('var SHIM_DEVICES_NODE_ID = "dsh-remote-devices"'), "client.js 里缺少节点 id 常量");
+	assert(SOURCE.includes("globalThis.__DSH_REMOTE_DEVICES__"), "client.js 必须读垫片发布的全局快照");
+	assert(SOURCE.includes("readShimDevicesNode"), "必须保留隐藏 JSON 节点那一路");
+	assert(SOURCE.includes("readPillShimDevices"), "老的 [data-device-id] 兜底必须保留（一行回退）");
 });
 
 //#endregion

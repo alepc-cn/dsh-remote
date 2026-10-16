@@ -1,8 +1,8 @@
 {
   "name": "@local/dsh-remote",
-  "version": "0.11.14",
+  "version": "0.12.0",
   "private": true,
-  "description": "DSH 远程设备插件：把别的机器上的 DSH 会话改道到本机界面（切设备 / 另存为 / 分叉到），并让外部通过「对外端口」访问本机（DSH 自己只听 127.0.0.1）。注意：停用插件＝代理＋垫片＋对外入口全停（外部进不来，只能用本机 loopback 救）；插件不改 DSH 自己的配置。仓库：https://github.com/alepc-cn/dsh-remote",
+  "description": "DSH 远程设备插件：把别的机器上的 DSH 会话改道到本机界面（切设备 / 另存为 / 分叉到），并让外部通过「对外端口」访问本机（DSH 自己只听 127.0.0.1）。0.12.0：新增浏览器口 GET /dsh-remote-view（非 /plugin/ 前缀，浏览器/手机经对外端口也能画出各设备状态点，并在聚合里带版本号）；已知不可达的对端禁切（只提示，不再弹确认）；非回环会话（手机/浏览器）连续两次聚合判不可达会自动回到本机，桌面端不受影响；垫片不再画任何 UI（胶囊死代码整段删除）。注意：停用插件＝代理＋垫片＋对外入口全停（外部进不来，只能用本机 loopback 救）；插件不改 DSH 自己的配置。仓库：https://github.com/alepc-cn/dsh-remote",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

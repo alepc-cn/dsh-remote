@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="360" viewBox="0 0 980 360" role="img" aria-label="dsh-remote 结构示意：本机 DSH 界面通过设备列表切换到设备 A、设备 B、设备 C">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2f6fed"/>
+    </marker>
+  </defs>
+
+  <rect width="980" height="360" fill="#f7f8fa"/>
+
+  <text x="40" y="52" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="24" font-weight="700" fill="#1f2430">dsh-remote 结构示意</text>
+  <text x="40" y="80" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="14" fill="#6b7280">在一个 DSH 界面里切换其它设备；示意图不包含任何真实地址或个人信息。</text>
+
+  <!-- 本机 DSH 界面 -->
+  <rect x="40" y="130" width="240" height="120" rx="14" fill="#ffffff" stroke="#9aa3b2" stroke-width="1.5"/>
+  <text x="160" y="176" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="17" font-weight="600" fill="#1f2430">本机 DSH</text>
+  <text x="160" y="202" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="13" fill="#6b7280">界面与设备列表</text>
+  <text x="160" y="224" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="13" fill="#6b7280">切换 / 回本机</text>
+
+  <!-- 设备 A -->
+  <rect x="420" y="96" width="200" height="92" rx="14" fill="#ffffff" stroke="#9aa3b2" stroke-width="1.5"/>
+  <text x="520" y="136" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="16" font-weight="600" fill="#1f2430">设备 A</text>
+  <text x="520" y="160" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="13" fill="#6b7280">DSH</text>
+
+  <!-- 设备 B -->
+  <rect x="420" y="204" width="200" height="92" rx="14" fill="#ffffff" stroke="#9aa3b2" stroke-width="1.5"/>
+  <text x="520" y="244" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="16" font-weight="600" fill="#1f2430">设备 B</text>
+  <text x="520" y="268" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="13" fill="#6b7280">DSH</text>
+
+  <!-- 设备 C -->
+  <rect x="740" y="150" width="200" height="92" rx="14" fill="#ffffff" stroke="#9aa3b2" stroke-width="1.5"/>
+  <text x="840" y="190" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="16" font-weight="600" fill="#1f2430">设备 C</text>
+  <text x="840" y="214" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="13" fill="#6b7280">DSH</text>
+
+  <!-- 连线 -->
+  <line x1="280" y1="176" x2="420" y2="142" stroke="#2f6fed" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <line x1="280" y1="190" x2="420" y2="250" stroke="#2f6fed" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <line x1="620" y1="196" x2="740" y2="196" stroke="#2f6fed" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <!-- 网络说明 -->
+  <rect x="40" y="292" width="900" height="44" rx="10" fill="#eef2fb" stroke="#c8d4f0" stroke-width="1"/>
+  <text x="56" y="319" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="13" fill="#2f4a86">网络：默认支持局域网直连；异地 / 远程访问需要自行准备可达链路，插件本身不提供网络打通能力。</text>
+</svg>

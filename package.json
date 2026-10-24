@@ -1,0 +1,21 @@
+{
+  "name": "@local/dsh-remote",
+  "version": "0.13.6",
+  "private": true,
+  "description": "DSH 多设备协作插件：在一个 DSH 界面内切换到其它设备的 DSH，并支持跨机另存为与会话分叉。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

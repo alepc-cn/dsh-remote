@@ -1,0 +1,15 @@
+# Patch layer for @local/dsh-remote.
+# 只把宿主半注册成一个 cordis Loader 条目（id 与 name 都等于包名），
+# 形态与 @local/dsh-device-switch / @local/dsh-token-copy 的 cordis.patch.yml 一致。
+# 行为全部在 lib/index.js（客户端半在 lib/client.js，由 exports["./client"] 暴露）：
+#   - /dev/<id>/… 的 HTTP 反向代理（I1：绝不把 text/html 返回给窗口，一律 404 纯文本）
+#   - /dev/<id>/<REMOTE_STREAM_MUX_PATH> 的 WebSocket 转发（该路径**动态提取**，不硬编码）
+#   - 往**本机**页面纯追加一条自包含垫片脚本（桌面壳走 webserver/index-inject 的 script 行，
+#     浏览器走 tapIndex），由垫片把 api/ 请求与长连接改道到 /dev/<id>/…，并 POST 一次报到
+#   - /plugin/remote/{state,urls,devices,test/<id>,enabled,hello}（只回环可读，绝不 text/html）
+#   - I2：不改动本机 HTML 的任何既有内容（0.1.0 的 <base> / __DSH_TRANSPORT__ 覆盖早已删除）
+# devices 与 enabled 存在 $DSH_HOME/remote-devices.json（插件自己的数据文件），不写 profile patch；
+# token 优先存 ctx.credentials。profile 里 config.devices/current 只作为数据文件缺失时的一次性种子。
+- insert:
+    - id: '@local/dsh-remote'
+      name: '@local/dsh-remote'

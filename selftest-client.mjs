@@ -1039,7 +1039,7 @@ const DEFAULT_STATE = {
 	edge: { enabled: false, port: 19387, running: false, error: null, targetPort: 19387, blockedPrefixes: ["/plugin/"] },
 	devices: [
 		{ id: "home", name: "设备A", url: "http://127.0.0.1:19387", local: true, reachable: true, lastError: "", lastOkAt: "2026-10-12T08:00:00.000Z", auth: "key" },
-		{ id: "vps", name: "VPS", url: "http://192.0.2.4:19387", local: false, reachable: false, lastError: "connect ECONNREFUSED", lastOkAt: null, auth: "token" },
+		{ id: "vps", name: "VPS", url: "http://192.0.2.4:19387", local: false, reachable: false, lastError: "connect ECONNREFUSED", lastOkAt: "2026-10-12T08:00:00.000Z", auth: "token" },
 		{ id: "laptop", name: "笔记本", url: "http://192.0.2.30:19387", local: false, reachable: null, lastError: "", lastOkAt: null, auth: "none" },
 	],
 	diagnostics: {
@@ -1228,15 +1228,15 @@ check("字段缺失：降级成占位文案（未提供 / 未发现 / 无），�
 check("设备管理：真 <table>、6 列表头、三态可达、最近错误/上次成功、● 当前", async () => {
 	const { tree } = await connectionPage();
 	const allText = collectText(tree);
-	assert(allText.includes("设备A") && allText.includes("VPS") && allText.includes("笔记本"), "三台设备都要出现");
+	assert(!allText.includes("设备A") && allText.includes("VPS") && allText.includes("笔记本"), "设备管理只列远端（本机行隐藏）");
 	assert(allText.includes("✅") && allText.includes("❌") && allText.includes("未测"), "三态可达都要出现");
 	assert(allText.includes("connect ECONNREFUSED"), "应显示最近错误");
 	assert(allText.includes("上次成功："), "应显示最近一次成功时间");
-	assert(allText.includes("● 当前"), "本机在选中状态时应有「● 当前」标记");
+	assert(allText.includes("当前设备：本机"), "本机状态由顶部标题显示");
 	assert(allText.includes("本机") && allText.includes("远端"), "位置列要区分本机/远端");
 	assertEqual(findAll(tree, (node) => node.type === "table").length, 1, "必须是真 <table>");
 	assertEqual(findAll(tree, (node) => node.type === "th").length, 6, "6 列表头");
-	assertEqual(findAll(tree, (node) => node.type === "td").length, 18, "3 台设备 × 6 列");
+	assertEqual(findAll(tree, (node) => node.type === "td").length, 12, "2 台远端设备 × 6 列");
 });
 
 check("0.13.1 回退：设置页没有「本机设备密钥」/「认证」列（回到 token 单一机制）", async () => {
@@ -1247,18 +1247,20 @@ check("0.13.1 回退：设置页没有「本机设备密钥」/「认证」列�
 	assert(!allText.includes("对端设备密钥"), "新增/修改表单不应再有「对端设备密钥」");
 });
 
-check("设备管理：四个操作按钮齐全，token 是密码框，开关旁说明了「停用后等于没装」", async () => {
+check("设备管理：操作按钮齐全，新增表单只有名称与地址（地址含 token），开关旁说明了「停用后等于没装」", async () => {
 	const { tree } = await connectionPage();
 	const allText = collectText(tree);
-	assert(findButton(tree, "回到本机") !== undefined, "本机那行按钮应为「回到本机」");
+	assert(findButton(tree, "返回本机") !== undefined, "设备管理标题栏应有「返回本机」");
 	assertEqual(findAllButtons(tree, "切换到此设备").length, 2, "两台远端各一个「切换到此设备」");
-	assertEqual(findAllButtons(tree, "测试连通").length, 3, "三台设备各一个测试按钮");
-	assertEqual(findAllButtons(tree, "修改").length, 3, "三台设备各一个修改按钮");
-	assertEqual(findAllButtons(tree, "删除").length, 3, "三台设备各一个删除按钮");
+	assertEqual(findAllButtons(tree, "测试连通").length, 2, "两台远端各一个测试按钮");
+	assertEqual(findAllButtons(tree, "修改").length, 2, "两台远端各一个修改按钮");
+	assertEqual(findAllButtons(tree, "删除").length, 2, "两台远端各一个删除按钮");
+	assertEqual(findAllButtons(tree, "↑").length, 2, "两台远端各一个上移按钮");
+	assertEqual(findAllButtons(tree, "↓").length, 2, "两台远端各一个下移按钮");
 	assert(findButton(tree, "新增") !== undefined, "应有新增按钮");
 	assert(allText.includes("已启用"), "enabled=true 时开关应显示已启用");
 	assert(allText.includes("软开关：停用只停止代理与注入；要彻底关停请卸载本插件"), "开关旁必须有软开关标注（与 package.json 描述一致）");
-	assertEqual(findAll(tree, (node) => node.type === "input" && node.props.type === "password").length, 1, "token 必须是密码输入框");
+	assertEqual(findAll(tree, (node) => node.type === "input" && node.props.type === "password").length, 0, "新增表单不再单独放 token 输入框（地址里含 token）");
 });
 
 check("顶部当前设备：默认本机；localStorage 有值时显示设备名字", async () => {
@@ -1524,11 +1526,11 @@ check("切换到此设备：写 dsh-device-switch:current = 该行 id + location
 	assertEqual(sandbox.reloads, 1, "应 reload 一次");
 });
 
-check("回到本机：removeItem 那个键 + location.reload()", async () => {
+check("返回本机（标题栏按钮）：removeItem 那个键 + location.reload()", async () => {
 	const { sandbox, tree } = await connectionPage({ current: "vps" });
 	// 清掉"造场景"时写进去的那一条，只断言点击产生的动作。
 	sandbox.localStorage.log.length = 0;
-	clickNth(tree, "回到本机", 0);
+	clickNth(tree, "返回本机", 0);
 	const ops = sandbox.localStorage.log.filter((entry) => entry.key === "dsh-device-switch:current");
 	assertEqual(ops.length, 1, "应恰好动一次这个键");
 	assertEqual(ops[0].op, "remove", "切回本机必须是 removeItem");
@@ -1538,7 +1540,7 @@ check("回到本机：removeItem 那个键 + location.reload()", async () => {
 
 check("测试连通：POST /test/<id>，两段式「测试中… → ✅ 连通 状态码/耗时」", async () => {
 	const { sandbox, tree } = await connectionPage({ responses: { "/plugin/remote/test/vps": { ok: true, status: 200, ms: 42 } } });
-	clickNth(tree, "测试连通", 1); // 第 2 个测试按钮 = vps
+	clickNth(tree, "测试连通", 0); // 第 1 个测试按钮 = vps
 	const pendingTree = rerender(sandbox);
 	assert(collectText(pendingTree).includes("测试中…"), "点击后应先显示「测试中…」");
 	const rendered = await sandbox.settleRenders(page(sandbox).component);
@@ -1555,7 +1557,7 @@ check("测试连通：宿主半回 ok:false（HTTP 200 的测试结果）→「�
 	const { sandbox, tree } = await connectionPage({
 		responses: { "/plugin/remote/test/vps": { ok: false, status: null, ms: 7, error: "connect ECONNREFUSED" } },
 	});
-	clickNth(tree, "测试连通", 1);
+	clickNth(tree, "测试连通", 0);
 	const rendered = await sandbox.settleRenders(page(sandbox).component);
 	const allText = collectText(rendered.tree);
 	assert(allText.includes("❌ 不通"), `应显示「❌ 不通」，实际：${allText.slice(0, 300)}`);
@@ -1566,7 +1568,7 @@ check("测试连通：宿主半回 ok:false（HTTP 200 的测试结果）→「�
 
 check("删除：二次确认带设备名；确认后 DELETE /plugin/remote/devices/<id>", async () => {
 	const { sandbox, tree } = await connectionPage({ confirmAnswer: true, responses: { "/plugin/remote/devices/vps": { ok: true } } });
-	clickNth(tree, "删除", 1); // 第 2 行 = vps
+	clickNth(tree, "删除", 0); // 第 1 行 = vps
 	await settle();
 	assertEqual(sandbox.confirms.length, 1, "必须弹一次二次确认");
 	assert(sandbox.confirms[0].includes("VPS"), `确认文案应带设备名：${sandbox.confirms[0]}`);
@@ -1577,7 +1579,7 @@ check("删除：二次确认带设备名；确认后 DELETE /plugin/remote/devic
 
 check("删除：二次确认里选「取消」时一个 DELETE 都不发", async () => {
 	const { sandbox, tree } = await connectionPage({ confirmAnswer: false });
-	clickNth(tree, "删除", 1);
+	clickNth(tree, "删除", 0);
 	await settle();
 	assertEqual(sandbox.confirms.length, 1, "必须弹二次确认");
 	assertEqual(filterBy(sandbox.fetchCalls, (entry) => entry.init.method === "DELETE").length, 0, "取消后不该发 DELETE");
@@ -1586,7 +1588,7 @@ check("删除：二次确认里选「取消」时一个 DELETE 都不发", async
 check("删除当前选中的设备后顺手回到本机（清掉 localStorage 键）", async () => {
 	const { sandbox, tree } = await connectionPage({ current: "vps", responses: { "/plugin/remote/devices/vps": { ok: true } } });
 	sandbox.localStorage.log.length = 0;
-	clickNth(tree, "删除", 1);
+	clickNth(tree, "删除", 0);
 	await settle();
 	const ops = sandbox.localStorage.log.filter((entry) => entry.key === "dsh-device-switch:current");
 	assertEqual(ops.length, 1, "应恰好动一次这个键");
@@ -1735,16 +1737,13 @@ check("插件开关：宿主半回 {ok:false,error} 时展示错误，不显示�
 	assert(sandbox.localStorage.has("dsh-device-switch:current"), "失败时不许清掉当前设备");
 });
 
-check("新增设备表单：填好后 POST /plugin/remote/devices（带 name/url/token，不带 id）", async () => {
+check("新增设备表单：名称 + 地址（地址里含 token）→ POST /devices（url 去掉 token、token 单独带、不带 id）", async () => {
 	const { sandbox, tree } = await connectionPage({ responses: { "/plugin/remote/devices": { ok: true, device: { id: "new" } } } });
 	const nameInput = findAll(tree, (node) => node.type === "input" && node.props.placeholder === "例如 设备A")[0];
-	const urlInput = findAll(tree, (node) => node.type === "input" && String(node.props.placeholder).startsWith("http://192.0.2.20"))[0];
-	const tokenInput = findAll(tree, (node) => node.type === "input" && node.props.type === "password")[0];
-	assert(nameInput !== undefined && urlInput !== undefined && tokenInput !== undefined, "表单三个输入都要在");
+	const addressInput = findAll(tree, (node) => node.type === "input" && String(node.props.placeholder).startsWith("http://192.0.2.20:19387/?token="))[0];
+	assert(nameInput !== undefined && addressInput !== undefined, "表单只有两个输入：名称 + 地址");
 	nameInput.props.onChange({ target: { value: "书房" } });
-	urlInput.props.onChange({ target: { value: "http://198.51.100.5:19387" } });
-	tokenInput.props.onChange({ target: { value: "tok-123" } });
-	// onChange 只是 setState：真实 React 会重渲染，再点按钮时闭包里才是填好的值。
+	addressInput.props.onChange({ target: { value: "http://198.51.100.5:19387/?token=tok-123" } });
 	const filled = rerender(sandbox);
 	clickNth(filled, "新增", 0);
 	await settle();
@@ -1753,48 +1752,36 @@ check("新增设备表单：填好后 POST /plugin/remote/devices（带 name/url
 	assertEqual(call.init.method, "POST", "必须 POST");
 	const body = JSON.parse(call.init.body);
 	assertEqual(body.name, "书房", "name 必须带上");
-	assertEqual(body.url, "http://198.51.100.5:19387", "url 必须带上");
-	assertEqual(body.token, "tok-123", "token 必须带上");
+	assertEqual(body.url, "http://198.51.100.5:19387/", "url 必须去掉 token 参数");
+	assertEqual(body.token, "tok-123", "token 必须从地址里解析出来");
 	assertEqual(body.id, undefined, "新增时不该带 id");
 });
 
-check("新增表单：token 留空时请求体里**没有** token 字段（=修改时留空表示不改动）", async () => {
+check("新增表单：地址里没有 token 时给中文提示、不发请求", async () => {
 	const { sandbox, tree } = await connectionPage({ responses: { "/plugin/remote/devices": { ok: true } } });
 	const nameInput = findAll(tree, (node) => node.type === "input" && node.props.placeholder === "例如 设备A")[0];
-	const urlInput = findAll(tree, (node) => node.type === "input" && String(node.props.placeholder).startsWith("http://192.0.2.20"))[0];
+	const addressInput = findAll(tree, (node) => node.type === "input" && String(node.props.placeholder).startsWith("http://192.0.2.20:19387/?token="))[0];
 	nameInput.props.onChange({ target: { value: "书房" } });
-	urlInput.props.onChange({ target: { value: "http://198.51.100.5:19387" } });
+	addressInput.props.onChange({ target: { value: "http://198.51.100.5:19387" } });
 	const filled = rerender(sandbox);
 	clickNth(filled, "新增", 0);
 	await settle();
-	const call = findBy(sandbox.fetchCalls, (entry) => entry.url === "/plugin/remote/devices");
-	assert(call !== undefined, "应打 POST /devices");
-	const body = JSON.parse(call.init.body);
-	assertEqual(body.token, undefined, "token 留空就该整个字段都不带");
-	assertEqual(body.name, "书房", "name 必须带上");
-});
-
-check("新增表单：名称为空时不发请求，只给中文校验提示", async () => {
-	const { sandbox, tree } = await connectionPage({ responses: { "/plugin/remote/devices": { ok: true } } });
-	clickNth(tree, "新增", 0);
-	await settle();
 	assert(findBy(sandbox.fetchCalls, (entry) => entry.url === "/plugin/remote/devices") === undefined, "校验不过不该发请求");
-	const rendered = rerender(sandbox);
-	assert(collectText(rendered).includes("名称不能为空"), "应给中文校验提示");
+	assert(collectText(rerender(sandbox)).includes("地址里要带 token"), "应提示地址里要带 token");
 });
 
-check("修改：点某行的「修改」→ 该行给出提示；源码断言初值取自 props.device 且提交带 id", async () => {
+check("修改：点某行的「修改」→ 在该行下方展开修改表单（地址回填、提交带 id）", async () => {
 	const { sandbox, tree } = await connectionPage();
 	clickNth(tree, "修改", 1); // 选 vps 那行
+	await settle();
 	const rendered = rerender(sandbox);
 	const allText = collectText(rendered);
-	assert(allText.includes("已选中这台设备"), "该行应提示已选中，表单会带上它的 id");
-	assert(allText.includes("保存修改") || allText.includes("收起"), "该行「修改」按钮应切换状态");
-	const at = SOURCE.indexOf("function DeviceForm");
-	const body = SOURCE.slice(at, at + 1200);
-	assert(body.includes("asObject(props.device)"), "修改模式的初值应来自 props.device");
-	assert(SOURCE.includes('if (form.id !== "") payload.id = form.id'), "提交时必须带上 id");
-	assert(SOURCE.includes("var formKey = editId === null"), "换编辑目标时要换 key（真 React 才会重挂表单、用新初值）");
+	assert(allText.includes("收起"), "点「修改」后该行按钮应变成「收起」");
+	assert(SOURCE.includes('key: "edit-" + editRowId'), "修改表单应作为独立行插在该行下方");
+	assert(SOURCE.includes("colSpan: 6"), "编辑行占满整行，不改动原行布局");
+	const addressInputs = findAll(rendered, (node) => node.type === "input");
+	assert(SOURCE.includes("device: asObject(devices[index])"), "行内编辑应把该行设备传给表单");
+	assert(SOURCE.includes('if (isEdit === true) payload.id = form.id'), "提交时必须带上 id");
 });
 
 check("复制按钮：点击调用 clipboard.writeText，按钮先「已复制」、1.5s 后复位", async () => {
@@ -2366,6 +2353,8 @@ check("接口只打契约路由（/plugin/remote/*），含「配置」块的 PO
 		path === "/enabled" ||
 		path === "/access" ||
 		path === "/fork" ||
+		path === "/log" ||
+		path === "/log/clear" ||
 		path.startsWith("/test/") ||
 		path.startsWith("/devices/");
 	for (const path of paths) assert(allowed(path), `出现未在契约里的接口：${path}`);

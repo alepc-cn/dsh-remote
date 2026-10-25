@@ -3154,7 +3154,7 @@ async function main() {
 	const state = stateResponse.json;
 	check("状态 200 且是 JSON", stateResponse.status === 200 && state !== null, `status=${stateResponse.status}`);
 	check("顶层字段集合正好是契约里那 7 个（顺序无关）",
-		JSON.stringify(Object.keys(state).sort()) === JSON.stringify(["access","bridge","devices","diagnostics","edge","enabled","localDevice","version"]),
+		JSON.stringify(Object.keys(state).sort()) === JSON.stringify(["access","bridge","devices","diagnostics","edge","enabled","localDevice","update","version"]),
 		Object.keys(state).join(","));
 	check("enabled 是布尔、version 是本包版本", state.enabled === true && state.version === internals.VERSION,
 		`enabled=${String(state.enabled)} version=${String(state.version)}`);
@@ -3203,9 +3203,9 @@ async function main() {
 		JSON.stringify(state.access.localAddresses));
 	check("access.writable === false：这台假机器没有 config-editor（「配置」块的保存会如实报 503，不假成功）",
 		state.access.writable === false);
-	check("diagnostics 字段集合 = {injectionSeen,lastHelloAt,muxPath,muxPathFound,proxyRoutes,saveAs,fork,notes}",
+	check("diagnostics 字段集合 = {injectionSeen,lastHelloAt,muxPath,muxPathFound,proxyRoutes,saveAs,fork,notes,logFile,logDir}",
 		JSON.stringify(Object.keys(state.diagnostics).sort())
-		=== JSON.stringify(["fork", "injectionSeen", "lastHelloAt", "muxPath", "muxPathFound", "notes", "proxyRoutes", "saveAs"]),
+		=== JSON.stringify(["collectScript", "fork", "injectionSeen", "lastHelloAt", "logDir", "logFile", "muxPath", "muxPathFound", "notes", "proxyRoutes", "saveAs"]),
 		Object.keys(state.diagnostics).join(","));
 	check("diagnostics.muxPath/muxPathFound 来自发现结果（本次注入的是 /api/remote.mux）",
 		state.diagnostics.muxPath === "/api/remote.mux" && state.diagnostics.muxPathFound === true,
@@ -5512,7 +5512,7 @@ async function main() {
 		&& JSON.stringify(Object.keys(viewResp.json).sort()) === JSON.stringify(["at", "peers", "self", "version"]),
 		JSON.stringify(Object.keys(viewResp.json ?? {})).slice(0, 140));
 	check("version = 本机 dsh-remote 的版本号（internals.VERSION，与 package.json 的对账在 T0）",
-		viewResp.json?.version === internals.VERSION && internals.VERSION === "0.13.6",
+		viewResp.json?.version === internals.VERSION && internals.VERSION === "0.16.0",
 		String(viewResp.json?.version));
 	check("self / peers 与页面口**逐字段同形**（同一个 builder：键集与对端 id 完全一致；`at` 这类时间戳本来就每次都变）",
 		JSON.stringify(Object.keys(viewResp.json?.self ?? {}).sort()) === JSON.stringify(Object.keys(liveJson?.self ?? {}).sort())

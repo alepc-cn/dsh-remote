@@ -70,5 +70,5 @@ dsh plugin --profile desktop add <插件包地址或本地路径>
 ## 开发
 
 - `lib/index.js`：宿主侧（设备代理、注入、路由）。
-- `lib/client.js`：客户端侧（设备列表与切换界面）。
+- `lib/client.js、lib/shim.js`：客户端侧（设备列表与切换界面）。
 - `selftest.mjs`、`selftest-client.mjs`：自测。

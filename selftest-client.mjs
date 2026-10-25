@@ -2343,6 +2343,14 @@ check("没有外部资源（无 <link>/<script>/远程 src），样式全内联"
 	assert(!/\.css["']/.test(SOURCE), "不该引用 css 文件");
 });
 
+check("已知不可达的设备被点击时会**先重试连接**（源码断言）", () => {
+	assert(SOURCE.includes("function retryBlockedDevice("), "必须有 retryBlockedDevice");
+	assert(SOURCE.includes("retryBlockedDevice(target, blocked)"), "pickDevice 的 blocked 分支必须走重试");
+	assert(SOURCE.includes('request("/test/" + encodeURIComponent(id)'), "重试必须打 /test/<id>");
+	assert(SOURCE.includes("applyDeviceSwitch(id);"), "重试通过后必须直接切换");
+	assert(SOURCE.includes("仍然连不上"), "重试失败必须给用户原因");
+});
+
 check("接口只打契约路由（/plugin/remote/*），含「配置」块的 POST /access", () => {
 	const paths = new Set((SOURCE.match(/request\(\s*"([^"]*)"/g) || []).map((hit) => hit.replace(/^request\(\s*"/, "").replace(/"$/, "")));
 	assert(paths.size >= 5, `request() 调用点太少：${JSON.stringify([...paths])}`);

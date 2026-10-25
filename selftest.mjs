@@ -33,6 +33,20 @@ import { dirname, join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import { apply, inject, internals, name as pluginName } from "./lib/index.js";
 
+/**
+ * 宿主半源码全文（index.js + 抽出去的 lib/*.js）：源码扫描类断言统一看这份，
+ * 避免代码被抽成独立文件后断言因为"搬家"误报。文件不存在时自动跳过
+ * （便于分刀合入的中间状态也能跑）。只读，不参与运行时。
+ */
+const HOST_MODULE_PATHS = [
+	"./lib/index.js", "./lib/edge.js", "./lib/proxy.js", "./lib/attach.js", "./lib/live.js",
+	"./lib/data.js", "./lib/store.js", "./lib/devices.js", "./lib/reach.js",
+];
+const HOST_SOURCE = HOST_MODULE_PATHS
+	.filter((path) => existsSync(new URL(path, import.meta.url)))
+	.map((path) => readFileSync(new URL(path, import.meta.url), "utf8"))
+	.join("\n");
+
 const log = (...args) => console.log(...args);
 const section = (title) => log(`\n=== ${title} ===`);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -3839,7 +3853,7 @@ async function main() {
 			&& internals.effectiveForkTail({ data: { forkTailN: 0 } }) === 20
 			&& internals.effectiveForkTail({ data: { forkTailN: 999 } }) === 20);
 		check("宿主半的 fork 处理里 tailN 取的是「数据文件里存的值」，而不是写死的缺省（源码断言）",
-			readFileSync(new URL("./lib/index.js", import.meta.url), "utf8").includes("let tailN = effectiveForkTail(runtime);"));
+			HOST_SOURCE.includes("let tailN = effectiveForkTail(runtime);"));
 
 		// 数据文件里已经有值时：改完别的字段之后（重新 apply）照样读得到 —— 走的是 readDataFile → adoptData 那条路。
 		const rereadRouter = createRouter();
@@ -5286,8 +5300,8 @@ async function main() {
 			check("stopEdge 幂等且**同步**（返回 undefined；重复调用不炸、也不再多关一次）",
 				internals.stopEdge(runtime) === undefined && edgeState.running === false && wrapper.calls.close === 1);
 
-			// 定时器：宿主侧（lib/index.js）**每一个** setTimeout/setInterval 句柄都必须过 unrefTimer。
-			const hostSource = readFileSync(new URL("./lib/index.js", import.meta.url), "utf8");
+			// 定时器：宿主侧（lib/index.js + 抽出的 lib/*.js）**每一个** setTimeout/setInterval 句柄都必须过 unrefTimer。
+			const hostSource = HOST_SOURCE;
 			const missingUnref = [];
 			for (const match of hostSource.matchAll(/(?:const\s+)?((?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*)\s*=\s*set(?:Timeout|Interval)\(/gu)) {
 				const name = match[1];
@@ -5296,10 +5310,22 @@ async function main() {
 					missingUnref.push(`${name}@L${String(hostSource.slice(0, match.index).split("\n").length)}`);
 				}
 			}
-			check("lib/index.js 里每个 setTimeout/setInterval 句柄都过 unrefTimer（不留下会把 Host 拖住的定时器）",
+			check("宿主半（lib/index.js + lib/*.js）里每个 setTimeout/setInterval 句柄都过 unrefTimer（不留下会把 Host 拖住的定时器）",
 				missingUnref.length === 0, missingUnref.join(", "));
 			const timerStub = { calls: 0, unref() { this.calls += 1; } };
-			check("unrefTimer：有 unref 就调；null / 没有 unref 的桩也不炸（老 Node 与桩都能用）",
+				check("失败退避序列 = 2s → 4s → 8s → 16s → 30s（封顶 30s）",
+		internals.probeBackoffDelay(1) === 2000
+		&& internals.probeBackoffDelay(2) === 4000
+		&& internals.probeBackoffDelay(3) === 8000
+		&& internals.probeBackoffDelay(4) === 16000
+		&& internals.probeBackoffDelay(5) === 30000
+		&& internals.probeBackoffDelay(9) === 30000
+		&& internals.PROBE_BACKOFF_MAX_MS === 30000,
+		String(internals.probeBackoffDelay(5)));
+	check("退避只作用于后台轮询：用户操作（/test、切换、代理请求）不看 nextAt（源码断言）",
+		HOST_SOURCE.includes("probeBackoffDue(runtime, device.id)"));
+
+check("unrefTimer：有 unref 就调；null / 没有 unref 的桩也不炸（老 Node 与桩都能用）",
 				internals.unrefTimer(timerStub) === timerStub && timerStub.calls === 1
 				&& internals.unrefTimer(null) === null && typeof internals.unrefTimer({}) === "object");
 		} finally {
@@ -5512,7 +5538,7 @@ async function main() {
 		&& JSON.stringify(Object.keys(viewResp.json).sort()) === JSON.stringify(["at", "peers", "self", "version"]),
 		JSON.stringify(Object.keys(viewResp.json ?? {})).slice(0, 140));
 	check("version = 本机 dsh-remote 的版本号（internals.VERSION，与 package.json 的对账在 T0）",
-		viewResp.json?.version === internals.VERSION && internals.VERSION === "0.16.2",
+		viewResp.json?.version === internals.VERSION && internals.VERSION === "0.21.0",
 		String(viewResp.json?.version));
 	check("self / peers 与页面口**逐字段同形**（同一个 builder：键集与对端 id 完全一致；`at` 这类时间戳本来就每次都变）",
 		JSON.stringify(Object.keys(viewResp.json?.self ?? {}).sort()) === JSON.stringify(Object.keys(liveJson?.self ?? {}).sort())
@@ -5988,14 +6014,15 @@ async function main() {
 	//  N4 fetchPeerPath 的 401 兜底：forgetSession + 重兑 + 重试一次。
 	// ------------------------------------------------------------------
 	section("N1 0.13.1：0.13.0 的设备密钥机制不得残留（源码扫描）");
-	const indexSource = readFileSync(new URL("./lib/index.js", import.meta.url), "utf8");
+	// 源码扫描覆盖宿主半的全部文件（index.js + 抽出的 lib/*.js）：搬迁不该让禁忌 token 漏检。
+	const indexSource = HOST_SOURCE;
 	const clientSource = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
 	const forbiddenTokens = [
 		"x-dsh-remote-key", "DSH_REMOTE_DEVICE_KEY", "DSH_REMOTE_KEY_", "self-key", "deviceKey", "peerKeys",
 		"authModeOf", "peerKeyFor", "credentialLabel",
 	];
 	const forbiddenHits = [];
-	for (const [label, source] of [["index.js", indexSource], ["client.js", clientSource]]) {
+	for (const [label, source] of [["host", indexSource], ["client.js", clientSource]]) {
 		for (const token of forbiddenTokens) {
 			if (source.includes(token)) forbiddenHits.push(`${label}:${token}`);
 		}

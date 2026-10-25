@@ -21,3 +21,7 @@ jobs:
           node --check lib/client.js
           node --check selftest.mjs
           node --check selftest-client.mjs
+      - name: selftest
+        run: node selftest.mjs
+      - name: selftest-client
+        run: node selftest-client.mjs

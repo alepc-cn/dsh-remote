@@ -42,7 +42,7 @@ dsh plugin --profile desktop add <插件包地址或本地路径>
 - token 仅保存在本机凭据存储中。
 - 对外端口暴露到公网时，建议配合访问控制或限流措施。
 
-> 发布与内容规范见 [RELEASE.md](RELEASE.md)。
+> 发布与内容规范见 [RELEASE.md](RELEASE.md)；常见问题见 [FAQ](docs/FAQ.md)。
 
 ## 诊断日志
 

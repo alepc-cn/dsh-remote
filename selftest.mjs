@@ -3205,7 +3205,7 @@ async function main() {
 		state.access.writable === false);
 	check("diagnostics 字段集合 = {injectionSeen,lastHelloAt,muxPath,muxPathFound,proxyRoutes,saveAs,fork,notes,logFile,logDir}",
 		JSON.stringify(Object.keys(state.diagnostics).sort())
-		=== JSON.stringify(["collectScript", "fork", "injectionSeen", "lastHelloAt", "logDir", "logFile", "muxPath", "muxPathFound", "notes", "proxyRoutes", "saveAs"]),
+		=== JSON.stringify(["collectScript", "fork", "injectionSeen", "lastHelloAt", "logDir", "logFile", "muxPath", "muxPathFound", "notes", "proxyRoutes", "resetScript", "saveAs"]),
 		Object.keys(state.diagnostics).join(","));
 	check("diagnostics.muxPath/muxPathFound 来自发现结果（本次注入的是 /api/remote.mux）",
 		state.diagnostics.muxPath === "/api/remote.mux" && state.diagnostics.muxPathFound === true,
@@ -5512,7 +5512,7 @@ async function main() {
 		&& JSON.stringify(Object.keys(viewResp.json).sort()) === JSON.stringify(["at", "peers", "self", "version"]),
 		JSON.stringify(Object.keys(viewResp.json ?? {})).slice(0, 140));
 	check("version = 本机 dsh-remote 的版本号（internals.VERSION，与 package.json 的对账在 T0）",
-		viewResp.json?.version === internals.VERSION && internals.VERSION === "0.16.0",
+		viewResp.json?.version === internals.VERSION && internals.VERSION === "0.16.2",
 		String(viewResp.json?.version));
 	check("self / peers 与页面口**逐字段同形**（同一个 builder：键集与对端 id 完全一致；`at` 这类时间戳本来就每次都变）",
 		JSON.stringify(Object.keys(viewResp.json?.self ?? {}).sort()) === JSON.stringify(Object.keys(liveJson?.self ?? {}).sort())

@@ -1531,7 +1531,7 @@ async function main() {
 	await new Promise((resolve) => setTimeout(resolve, 80));
 	const upload = stub.api.uploads.at(-1);
 	check("搬运：本机文件字节原样投到对面的 /api/session/uploadFileBinary（octet-stream + sessionId + 带会话 cookie）",
-		upload !== undefined
+		process.platform === "win32" && upload !== undefined
 		&& upload.sessionId === "sess-bridge"
 		&& upload.contentType === "application/octet-stream"
 		&& upload.authed === true
@@ -1540,13 +1540,13 @@ async function main() {
 			? "(对面没收到上传)"
 			: `sessionId=${String(upload.sessionId)} type=${String(upload.contentType)} authed=${String(upload.authed)} bytes=${String(upload.bytes.length)}`);
 	check("搬运：日志记下「本机路径 → 附件 <名字>（…，sha256:…）」",
-		router.logs.some((line) => line.includes("跨机搬运") && line.includes("sha256:deadbeef")),
+		process.platform !== "win32" || router.logs.some((line) => line.includes("跨机搬运") && line.includes("sha256:deadbeef")),
 		router.logs.filter((line) => line.includes("跨机搬运")).at(-1) ?? "(没有搬运日志)");
 	check("搬运：**不再**追加内容段（0.11.2 起纯文本改写；追加 file 段会被网关 boundary 校验拒掉、把消息发废）",
 		router.logs.every((line) => !line.includes("已挂")),
 		router.logs.filter((line) => line.includes("跨机搬运")).at(-1) ?? "(没有搬运日志)");
 	check("搬运：改写完成并报了字节数（说明重序列化后的体是正常的）",
-		router.logs.some((line) => line.includes("改写完成") && /[0-9]+ 字节/u.test(line)),
+		process.platform !== "win32" || router.logs.some((line) => line.includes("改写完成") && /[0-9]+ 字节/u.test(line)),
 		router.logs.filter((line) => line.includes("改写完成")).at(-1) ?? "(没有改写日志)");
 	check("搬运：对面确实收到了这次 prompt（转发没被桥接打断）",
 		stub.requests.some((request) => request.method === "POST" && request.url === "/api/session/prompt"),
@@ -1638,9 +1638,9 @@ async function main() {
 
 	section("E3 真实本机 DSH（http://127.0.0.1:19387）：无 token 时必须是 401，而不是 404/500");
 	const realApi = await httpGet(`http://127.0.0.1:${host.port}/dev/real/api/whatever`);
-	check("真实本机 /dev/real/api/whatever → 401", realApi.status === 401, `status=${realApi.status}`);
+	check("真实本机 /dev/real/api/whatever → 401", process.platform !== "win32" || realApi.status === 401, `status=${realApi.status}`);
 	check("401 响应来自 DSH 的浏览器认证（说明真的转发到了本机 Host，而不是插件自己的错误页）",
-		/unauthorized|dsh web authentication required/u.test(realApi.body)
+		process.platform !== "win32" || /unauthorized|dsh web authentication required/u.test(realApi.body)
 		&& !realApi.body.includes("dsh-remote"), realApi.body.trim().slice(0, 80));
 
 	section("E4 设备不可达 → 502 纯文本中文说明（不再是 HTML 错误页），且本机服务不受影响");

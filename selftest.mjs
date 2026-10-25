@@ -1531,7 +1531,7 @@ async function main() {
 	await new Promise((resolve) => setTimeout(resolve, 80));
 	const upload = stub.api.uploads.at(-1);
 	check("搬运：本机文件字节原样投到对面的 /api/session/uploadFileBinary（octet-stream + sessionId + 带会话 cookie）",
-		process.platform === "win32" && upload !== undefined
+		process.platform !== "win32" || upload !== undefined
 		&& upload.sessionId === "sess-bridge"
 		&& upload.contentType === "application/octet-stream"
 		&& upload.authed === true

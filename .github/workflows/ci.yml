@@ -23,13 +23,14 @@ jobs:
           node --check lib/logging.js
           node --check lib/util.js
           node --check lib/live.js
-          node --check lib/store.js
           node --check lib/reach.js
           node --check lib/devices.js
           node --check lib/data.js
           node --check lib/attach.js
           node --check lib/proxy.js
           node --check lib/edge.js
+          node --check lib/auth.js
+          node --check lib/notice.js
           node --check selftest.mjs
           node --check selftest-client.mjs
       - name: selftest

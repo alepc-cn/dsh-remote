@@ -945,24 +945,24 @@ function slotEntry(sandbox, slotName) {
 	throw new Error(`没有注册槽位 ${slotName}（实际：${entries.map((row) => row.options.name).join(", ")}）`);
 }
 
-check("inject 恰好 3 次，槽名是 settings.section + 文档头部按钮区 + 会话菜单", () => {
+check("inject 4 次：settings.section + 文档头部按钮区 + 会话菜单 + 会话记忆插槽", () => {
 	const injected = boot.log.filter((entry) => entry.op === "inject");
-	assertEqual(injected.length, 3, "inject 次数");
+	assertEqual(injected.length, 4, "inject 次数");
 	assertEqual(
 		JSON.stringify(injected.map((entry) => entry.slotName)),
-		JSON.stringify(["settings.section", "sidebar.right.tab.document.actions", "sidebar.workspaces.session.menu.item"]),
+		JSON.stringify(["settings.section", "sidebar.right.tab.document.actions", "sidebar.workspaces.session.menu.item", "conversation.input.left"]),
 		"槽名与顺序（settings.section 必须第一个：后面的用例按 [0] 取它）",
 	);
 });
 
-check("注册了 3 项：1 个 settings.section + 文档头部按钮区 + 会话菜单（原来那三页不再存在）", () => {
-	assertEqual(SECTIONS.length, 3, `注册数（收到 ${SECTIONS.length} 个）`);
+check("注册了 4 项：1 个 settings.section + 文档头部按钮区 + 会话菜单 + 会话记忆", () => {
+	assertEqual(SECTIONS.length, 4, `注册数（收到 ${SECTIONS.length} 个）`);
 	const entry = SECTIONS[0];
 	assertEqual(entry.options.name, "settings.section", "第一项的槽名");
 	assertEqual(typeof entry.options.label, "function", "label 必须是函数");
 	assertEqual(typeof entry.component, "function", "组件必须是函数");
 	const names = SECTIONS.map((row) => row.options.name);
-	for (const wanted of ["sidebar.right.tab.document.actions", "sidebar.workspaces.session.menu.item"]) {
+	for (const wanted of ["sidebar.right.tab.document.actions", "sidebar.workspaces.session.menu.item", "conversation.input.left"]) {
 		assert(names.includes(wanted), `缺少槽位注册：${wanted}`);
 	}
 });
@@ -995,8 +995,8 @@ check("label 是「远程连接」，order = 60，id 是非空字符串", () => 
 });
 
 check("源码里只 register 五次（设置页 + 两个菜单项 + 两个目录流洞）；旧的三页 id 与标签都已清掉", () => {
-	assertEqual((SOURCE.match(/ctx\.slots\.register\(/g) || []).length, 5, "register 调用次数");
-	assertEqual((SOURCE.match(/ctx\.slots\.inject\(/g) || []).length, 5, "inject 调用次数（3 个功能位 + 两个目录流洞）");
+	assertEqual((SOURCE.match(/ctx\.slots\.register\(/g) || []).length, 6, "register 调用次数");
+	assertEqual((SOURCE.match(/ctx\.slots\.inject\(/g) || []).length, 6, "inject 调用次数（4 个功能位 + 两个目录流洞）");
 	for (const oldId of ["remote-access", "remote-devices", "remote-health"]) {
 		assert(!SOURCE.includes(`"${oldId}"`), `旧的三页 id 不该还在：${oldId}`);
 	}
@@ -1236,7 +1236,7 @@ check("设备管理：真 <table>、6 列表头、三态可达、最近错误/�
 	assert(allText.includes("本机") && allText.includes("远端"), "位置列要区分本机/远端");
 	assertEqual(findAll(tree, (node) => node.type === "table").length, 1, "必须是真 <table>");
 	assertEqual(findAll(tree, (node) => node.type === "th").length, 6, "6 列表头");
-	assertEqual(findAll(tree, (node) => node.type === "td").length, 12, "2 台远端设备 × 6 列");
+	assertEqual(findAll(tree, (node) => node.type === "td").length, 12, "2 台远端设备 × 6 列（本机条不在表里）");
 });
 
 check("0.13.1 回退：设置页没有「本机设备密钥」/「认证」列（回到 token 单一机制）", async () => {
@@ -2271,6 +2271,28 @@ check("0.13.2 源码扫描：lib/client.js 里 `alert(` 出现次数必须为 0�
 	assertEqual(hits.length, 0, `实测 ${String(hits.length)} 处（alert 会打断、关掉后输入框失焦）`);
 });
 
+check("0.22.0 会话记忆：隐藏插槽记 sessionId；切换时置一次性标记，回来后用 uiWorkspace.openSession 恢复（源码断言）", () => {
+	assert(SOURCE.includes("function SessionMemo("), "必须有 SessionMemo 组件");
+	assert(SOURCE.includes("conversation.input.left"), "必须挂到会话作用域插槽");
+	assert(SOURCE.includes("dsh-remote:last-session:"), "必须按设备记忆会话 id");
+	assert(SOURCE.includes("dsh-remote:restore-session"), "必须有一次性恢复标记");
+	assert(SOURCE.includes("service.openSession(pendingRestoreTarget)"), "恢复必须调用 uiWorkspace.openSession(SessionId)（SessionTarget = SessionId | SubagentAddress）");
+	assert(SOURCE.includes("restore: success"), "必须用隐藏插槽确认恢复成功");
+	assert(SOURCE.includes("restore: stop (another session active)"), "用户手动切走后必须停手");
+	assert(SOURCE.includes("lastSeenBlank"), "必须区分空会话（默认新会话窗口）");
+	assert(SOURCE.includes("globalThis.setTimeout(tryOpen, 400)"), "重试间隔应为 400ms");
+	assert(SOURCE.includes("SESSION_MEMO_FRESH_MS"), "记忆必须有有效期");
+});
+
+check("0.23.0 设备快捷键：Alt+1..9 直达、设备管理可改键/关闭（源码断言）", () => {
+	assert(SOURCE.includes("function hotkeyDeviceId("), "必须有 hotkeyDeviceId");
+	assert(SOURCE.includes("function comboFromEvent("), "必须把 keydown 转成组合键");
+	assert(SOURCE.includes("mods.join(\"+\") + \"+\" + key"), "录制必须保存组合键");
+	assert(SOURCE.includes("function hotkeyInput("), "设备管理必须有快捷键输入框");
+	assert(SOURCE.includes('hotkey: next'), "保存必须带 hotkey");
+	assert(SOURCE.includes("pickDevice(targetId, false, readCurrentId() === targetId)"), "快捷键必须走 pickDevice");
+});
+
 check("存储键名：localStorage 只有主键 + 别名；sessionStorage 只有哨兵 + force-active（宿主半同名）", () => {
 	// 看**字符串字面量**，避免把文档注释里的键名算进来。
 	const literals = SOURCE.match(/"[^"\n]*(?:dsh-device-switch|dsh-remote):[^"\n]*"/g) || [];
@@ -2284,14 +2306,15 @@ check("存储键名：localStorage 只有主键 + 别名；sessionStorage 只有
 	const forced = literals.filter((literal) => literal === `"${FORCE_ACTIVE_KEY}"`);
 	assertEqual(sentinel.length, 1, `哨兵键字面量应恰好一处，实际 ${JSON.stringify(literals)}`);
 	assertEqual(forced.length, 1, `force-active 键字面量应恰好一处，实际 ${JSON.stringify(literals)}`);
-	const allowed = new Set(['"dsh-device-switch:current"', '"dsh-remote:current"', `"${SENTINEL_KEY}"`, `"${FORCE_ACTIVE_KEY}"`]);
+	const allowed = new Set(['"dsh-device-switch:current"', '"dsh-remote:current"', `"${SENTINEL_KEY}"`, `"${FORCE_ACTIVE_KEY}"`, '"dsh-remote:last-session:"', '"dsh-remote:restore-session"']);
 	for (const literal of literals) {
 		assert(allowed.has(literal), `出现了非约定的键名：${literal}`);
 	}
 	// 整个文件里任何 dsh-device-switch:xxx / dsh-remote:xxx 的写法都必须是这四个键。
 	const anyKey = SOURCE.match(/dsh-device-switch:[A-Za-z0-9._:-]+|dsh-remote:[A-Za-z0-9._:-]+/g) || [];
 	for (const key of anyKey) {
-		assert(key === "dsh-device-switch:current" || key === "dsh-remote:current" || key === SENTINEL_KEY || key === FORCE_ACTIVE_KEY,
+		assert(key === "dsh-device-switch:current" || key === "dsh-remote:current" || key === SENTINEL_KEY || key === FORCE_ACTIVE_KEY
+				|| key === "dsh-remote:last-session:" || key === "dsh-remote:restore-session",
 			`出现了非约定的键名：${key}`);
 	}
 	// 两个会话级标记必须走 sessionStorage（写进 localStorage 就成了跨窗口残留）。
@@ -2361,6 +2384,8 @@ check("接口只打契约路由（/plugin/remote/*），含「配置」块的 PO
 		path === "/enabled" ||
 		path === "/access" ||
 		path === "/fork" ||
+		path === "/diag" ||
+		path === "/local" ||
 		path === "/log" ||
 		path === "/log/clear" ||
 		path.startsWith("/test/") ||
@@ -2503,7 +2528,7 @@ check("本机模式**不接管**：两个目录流洞一个都不注册（官方
 	assertEqual(threw, 2, "两个洞都必须没注册");
 	// 顺带守住：本机模式下连 inject 都不该发生（不打扰官方占据方）。
 	const injected = readArray(sandbox.log).filter((row) => row.op === "inject").map((row) => row.slotName);
-	assertEqual(JSON.stringify(injected), JSON.stringify(["settings.section", "sidebar.right.tab.document.actions", "sidebar.workspaces.session.menu.item"]), "本机模式的 inject 列表");
+	assertEqual(JSON.stringify(injected), JSON.stringify(["settings.section", "sidebar.right.tab.document.actions", "sidebar.workspaces.session.menu.item", "conversation.input.left"]), "本机模式的 inject 列表");
 });
 
 check("远端模式接管：两个洞各注册 1 项、priority = -1、同一个组件，且注册排在设置页之后", () => {
@@ -2513,7 +2538,7 @@ check("远端模式接管：两个洞各注册 1 项、priority = -1、同一个
 	const injected = readArray(sandbox.log).filter((row) => row.op === "inject").map((row) => row.slotName);
 	assertEqual(
 		JSON.stringify(injected),
-		JSON.stringify(["settings.section", "sidebar.right.tab.document.actions", "sidebar.workspaces.session.menu.item", DIR_HOLES[0], DIR_HOLES[1]]),
+		JSON.stringify(["settings.section", "sidebar.right.tab.document.actions", "sidebar.workspaces.session.menu.item", DIR_HOLES[0], DIR_HOLES[1], "conversation.input.left"]),
 		"接管发生在最后（两个洞各自 inject 一次）",
 	);
 	const heroes = entries.filter((row) => row.options.name === DIR_HOLES[0]);

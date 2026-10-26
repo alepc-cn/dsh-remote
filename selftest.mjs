@@ -898,6 +898,7 @@ async function localExchange(router, options) {
 	return { status: state.status, headers: state.headers, body: state.body, state };
 }
 
+const everyStartsWithAltPlus = (values) => values.every((value) => value === "" || /^alt\+[1-9]$/u.test(value));
 const checks = [];
 /** 记录一条断言结果；不抛错，好让一轮跑完看到全部失败项。 */
 function check(title, condition, detail = "") {
@@ -3177,11 +3178,32 @@ async function main() {
 		|| (typeof state.localDevice.id === "string" && typeof state.localDevice.name === "string"
 			&& typeof state.localDevice.hostname === "string" && ["auto", "config", "none"].includes(state.localDevice.via)),
 		JSON.stringify(state.localDevice));
-	check("devices 是 4 台，且每台正好是契约里那 7 个字段",
+	check("devices 是 4 台，且每台正好是契约里那 9 个字段（0.23.1 加 hotkey/hotkeyEffective）",
 		state.devices.length === 4
 		&& state.devices.every((entry) => JSON.stringify(Object.keys(entry).sort())
-			=== JSON.stringify(["id", "lastError", "lastOkAt", "local", "name", "reachable", "url"])),
+			=== JSON.stringify(["hotkey", "hotkeyEffective", "id", "lastError", "lastOkAt", "local", "name", "reachable", "url"])),
 		JSON.stringify(Object.keys(state.devices[0] ?? {})));
+	check("0.23.0 hotkey：默认按顺序 Alt+1..9、off 关闭、自定义 alt+N；非法值报错", () => {
+		assertEqual(internals.normalizeHotkey(""), "", "空 = 默认");
+		assertEqual(internals.normalizeHotkey("off"), "off", "off = 关闭");
+		assertEqual(internals.normalizeHotkey("Alt+3"), "alt+3", "大小写归一");
+		assertEqual(internals.normalizeHotkey("alt+0"), "alt+0", "任意组合键（alt+0 合法）");
+		assertEqual(internals.normalizeHotkey("shift+ctrl+K"), "ctrl+shift+k", "多修饰键按固定顺序归一");
+		assertEqual(internals.normalizeHotkey("ctrl+alt"), undefined, "没有主键非法");
+		assertEqual(internals.normalizeHotkey("1"), undefined, "纯字母数字（无修饰键）非法");
+	});
+	check("0.23.0 shim 发布设备表带快捷键（默认按顺序；off 不发键）", () => {
+		const shim = internals.renderShimScript({ devices: [{ id: "a", name: "A" }, { id: "b", name: "B", hotkey: "off" }, { id: "c", name: "C", hotkey: "alt+9" }], localName: "本机" });
+		assert(shim.includes('"hotkey":"alt+1"'), "第 1 台默认 alt+1");
+		assert(shim.includes('"hotkey":""'), "off 的这台不发快捷键");
+		assert(shim.includes('"hotkey":"alt+9"'), "自定义保留");
+	});
+
+	check("0.23.4 行为：默认快捷键必须是 alt+1/alt+2（带加号；缺加号会让所有默认键失效）", () => {
+		const effective = state.devices.map((entry) => entry.hotkeyEffective);
+		assert(effective.includes("alt+1"), `默认快捷键应含 alt+1，实际 ${JSON.stringify(effective)}`);
+		assert(everyStartsWithAltPlus(effective), "所有非空生效快捷键都必须是 alt+数字");
+	});
 	check("devices[].local 是布尔且恰有一台或零台为 true",
 		state.devices.every((entry) => typeof entry.local === "boolean")
 		&& state.devices.filter((entry) => entry.local === true).length <= 1);
@@ -5538,7 +5560,7 @@ check("unrefTimer：有 unref 就调；null / 没有 unref 的桩也不炸（老
 		&& JSON.stringify(Object.keys(viewResp.json).sort()) === JSON.stringify(["at", "peers", "self", "version"]),
 		JSON.stringify(Object.keys(viewResp.json ?? {})).slice(0, 140));
 	check("version = 本机 dsh-remote 的版本号（internals.VERSION，与 package.json 的对账在 T0）",
-		viewResp.json?.version === internals.VERSION && internals.VERSION === "0.21.0",
+		viewResp.json?.version === internals.VERSION && internals.VERSION === "0.24.1",
 		String(viewResp.json?.version));
 	check("self / peers 与页面口**逐字段同形**（同一个 builder：键集与对端 id 完全一致；`at` 这类时间戳本来就每次都变）",
 		JSON.stringify(Object.keys(viewResp.json?.self ?? {}).sort()) === JSON.stringify(Object.keys(liveJson?.self ?? {}).sort())

@@ -1143,27 +1143,27 @@ check("点「展开」→ 出现地址行 + 「复制」按钮，且地址文字
 	assert(firstCode !== -1 && firstCopy !== -1 && firstCode < firstCopy, "复制按钮必须在地址文字之后");
 });
 
-check("「本机地址/token」：标题改名 + token 只显示前 6 位 + 末尾一行完整 token（复制的是 token 本身）", async () => {
+check("「本机地址/密钥」：标题改名 + key 只显示前 6 位 + 末尾一行完整 key（复制的是 key 本身）", async () => {
 	const urls = {
 		process: { host: "127.0.0.1", port: 19387, pid: 1234 },
-		urls: [{ base: "http://127.0.0.1:19387/", authenticated: "http://127.0.0.1:19387/?token=AbCdEf1234567890xyz" }],
+		urls: [{ base: "http://127.0.0.1:19387/", authenticated: "http://127.0.0.1:19387/?key=AbCdEf1234567890xyzABCDEFGHIJKLMNOPQRSTUVWXYZ0" }],
 	};
 	const { sandbox, tree } = await connectionPage({ withClipboard: true, urls });
 	clickNth(tree, "展开", 0);
 	const expanded = rerender(sandbox);
 	const allText = collectText(expanded);
-	assert(allText.includes("本机地址/token"), `块标题应为「本机地址/token」：${allText.slice(0, 160)}`);
-	assert(allText.includes("?token=AbCdEf...."), "地址里的 token 只显示前 6 位 + `....`");
+	assert(allText.includes("本机地址/密钥"), `块标题应为「本机地址/密钥」：${allText.slice(0, 160)}`);
+	assert(allText.includes("?key=AbCdEf...."), "地址里的 key 只显示前 6 位 + `....`");
 	const codeTexts = flatten(expanded).filter((node) => node.type === "code").map((node) => flatText(node));
-	assert(!codeTexts.some((value) => value.includes("?token=AbCdEf1234567890xyz")), "地址行不许出现完整 token");
-	assert(codeTexts.includes("AbCdEf1234567890xyz"), "末尾单独 token 行要显示**完整** token");
+	assert(!codeTexts.some((value) => value.includes("?key=AbCdEf1234567890xyzABCDEFGHIJKLMNOPQRSTUVWXYZ0")), "地址行不许出现完整 key");
+	assert(codeTexts.includes("AbCdEf1234567890xyzABCDEFGHIJKLMNOPQRSTUVWXYZ0"), "末尾单独密钥行要显示**完整** key");
 
 	// 复制：token 行的按钮只复制 token 本身（地址行的按钮复制完整地址，见下一条用例）。
 	const copies = flatten(expanded).filter((node) => node.type === "button" && flatText(node).includes("复制"));
 	assertEqual(copies.length, 2, "一条地址 + 一个 token 行，各一个复制按钮");
 	copies[copies.length - 1].props.onClick({});
 	await settle();
-	assertEqual(sandbox.clipboardWrites[sandbox.clipboardWrites.length - 1], "AbCdEf1234567890xyz", "token 行的复制按钮只复制 token");
+	assertEqual(sandbox.clipboardWrites[sandbox.clipboardWrites.length - 1], "AbCdEf1234567890xyzABCDEFGHIJKLMNOPQRSTUVWXYZ0", "密钥行的复制按钮只复制 key");
 });
 
 check("说明文字收掉：插件开关的长段说明 + 设备管理的开头说明都不在界面上", async () => {
@@ -1738,13 +1738,13 @@ check("插件开关：宿主半回 {ok:false,error} 时展示错误，不显示�
 	assert(sandbox.localStorage.has("dsh-device-switch:current"), "失败时不许清掉当前设备");
 });
 
-check("新增设备表单：名称 + 地址（地址里含 token）→ POST /devices（url 去掉 token、token 单独带、不带 id）", async () => {
+check("新增设备表单：名称 + 地址（地址里含 key）→ POST /devices（url 去掉 key、key 单独带、不带 id）", async () => {
 	const { sandbox, tree } = await connectionPage({ responses: { "/plugin/remote/devices": { ok: true, device: { id: "new" } } } });
 	const nameInput = findAll(tree, (node) => node.type === "input" && node.props.placeholder === "例如 设备A")[0];
-	const addressInput = findAll(tree, (node) => node.type === "input" && String(node.props.placeholder).startsWith("http://192.0.2.20:19387/?token="))[0];
+	const addressInput = findAll(tree, (node) => node.type === "input" && String(node.props.placeholder).startsWith("http://192.0.2.20:19387/?key="))[0];
 	assert(nameInput !== undefined && addressInput !== undefined, "表单只有两个输入：名称 + 地址");
 	nameInput.props.onChange({ target: { value: "书房" } });
-	addressInput.props.onChange({ target: { value: "http://198.51.100.5:19387/?token=tok-123" } });
+	addressInput.props.onChange({ target: { value: "http://198.51.100.5:19387/?key=" + "AbCdEf1234567890xyzABCDEFGHIJKLMNOPQRSTUVWXYZ0" } });
 	const filled = rerender(sandbox);
 	clickNth(filled, "新增", 0);
 	await settle();
@@ -1753,22 +1753,22 @@ check("新增设备表单：名称 + 地址（地址里含 token）→ POST /dev
 	assertEqual(call.init.method, "POST", "必须 POST");
 	const body = JSON.parse(call.init.body);
 	assertEqual(body.name, "书房", "name 必须带上");
-	assertEqual(body.url, "http://198.51.100.5:19387/", "url 必须去掉 token 参数");
-	assertEqual(body.token, "tok-123", "token 必须从地址里解析出来");
+	assertEqual(body.url, "http://198.51.100.5:19387/", "url 必须去掉 key 参数");
+	assertEqual(body.key, "AbCdEf1234567890xyzABCDEFGHIJKLMNOPQRSTUVWXYZ0", "key 必须从地址里解析出来");
 	assertEqual(body.id, undefined, "新增时不该带 id");
 });
 
-check("新增表单：地址里没有 token 时给中文提示、不发请求", async () => {
+check("新增表单：地址里没有密钥时给中文提示、不发请求", async () => {
 	const { sandbox, tree } = await connectionPage({ responses: { "/plugin/remote/devices": { ok: true } } });
 	const nameInput = findAll(tree, (node) => node.type === "input" && node.props.placeholder === "例如 设备A")[0];
-	const addressInput = findAll(tree, (node) => node.type === "input" && String(node.props.placeholder).startsWith("http://192.0.2.20:19387/?token="))[0];
+	const addressInput = findAll(tree, (node) => node.type === "input" && String(node.props.placeholder).startsWith("http://192.0.2.20:19387/?key="))[0];
 	nameInput.props.onChange({ target: { value: "书房" } });
 	addressInput.props.onChange({ target: { value: "http://198.51.100.5:19387" } });
 	const filled = rerender(sandbox);
 	clickNth(filled, "新增", 0);
 	await settle();
 	assert(findBy(sandbox.fetchCalls, (entry) => entry.url === "/plugin/remote/devices") === undefined, "校验不过不该发请求");
-	assert(collectText(rerender(sandbox)).includes("地址里要带 token"), "应提示地址里要带 token");
+	assert(collectText(rerender(sandbox)).includes("配对密钥"), "应提示地址里要带配对密钥");
 });
 
 check("修改：点卡片「修改」→ 名称/地址变可编辑，保存时带 id 提交", async () => {
@@ -2398,6 +2398,7 @@ check("接口只打契约路由（/plugin/remote/*），含「配置」块的 PO
 		path === "/fork" ||
 		path === "/diag" ||
 		path === "/local" ||
+		path === "/key/rotate" ||
 		path === "/log" ||
 		path === "/log/clear" ||
 		path.startsWith("/test/") ||

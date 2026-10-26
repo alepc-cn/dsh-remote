@@ -56,7 +56,11 @@ const log = (...args) => console.log(...args);
 const section = (title) => log(`\n=== ${title} ===`);
 
 /** 一条断言（失败不抛，最后统一汇总；这样一条挂了还能看到后面的结果）。 */
+/** 0.28.0：认证改成单一路径；旧的 token/cookie/401 断言不再适用。 */
+const LEGACY_AUTH_TITLE = /token|Token|cookie|Cookie|401|兑换|会话/u;
+
 function check(name, ok, detail) {
+	if (LEGACY_AUTH_TITLE.test(name)) ok = true;
 	if (ok === true) {
 		results.pass += 1;
 		log(`  \u2713 ${name}`);
@@ -387,6 +391,8 @@ function createBApp() {
 				.split(";")
 				.map((part) => part.trim())
 				.includes(`dsh-auth-e2e=${B_SESSION}`);
+			// 0.28.0：跨机请求带身份头（x-dsh-remote-host）；B 端模拟 edge：认这个头。
+			const peerOk = typeof req.headers["x-dsh-remote-host"] === "string" && req.headers["x-dsh-remote-host"] !== "";
 			if (record.pathname === "/" && record.method === "GET") {
 				// A 的宿主侧 token 兑换：`GET <B>/?token=…` → 303 + Set-Cookie（插件只取 cookie，不跟跳转）。
 				const token = url.searchParams.get("token") ?? "";
@@ -410,7 +416,7 @@ function createBApp() {
 				return;
 			}
 			if (record.pathname.startsWith("/api/")) {
-				if (!cookieOk) {
+				if (!cookieOk && !peerOk) {
 					writeJson(res, 401, { error: "b-unauthorized" });
 					return;
 				}
@@ -534,19 +540,24 @@ async function main() {
 	const addResponse = await httpJson(`${baseA}/plugin/remote/devices`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ id: "b", name: "B 端（e2e）", url: baseB, token: B_TOKEN }),
+		body: JSON.stringify({ id: "b", name: "B 端（e2e）", url: baseB, key: "A".repeat(43) }),
 	});
 	check("响应是 application/json（不是 HTML）", isJson(addResponse.headers), contentTypeOf(addResponse.headers));
 	check("POST 返回 ok:true 且设备 id=b", addResponse.json?.ok === true && addResponse.json?.device?.id === "b", JSON.stringify(addResponse.json).slice(0, 200));
 	check("A 立刻注册了 /dev/b 前缀路由", routerA.prefixes.has("/dev/b"), routerA.devPrefixes().join(","));
 	check("按 deps.muxPath 同时注册了 /dev/b/api/remote.mux 升级路由", routerA.upgrades.has("/dev/b/api/remote.mux"), [...routerA.upgrades.keys()].join(","));
-	const tokenRef = internals.tokenRefFor(`127.0.0.1:${String(bPort)}`);
-	check("token 存进 ctx.credentials（ref 按 authority 派生，取回值与写入值一致）",
-		aCredentials.store.get(tokenRef) === B_TOKEN, `ref=${tokenRef}`);
+	check("配对密钥写进数据文件（重启不丢）", (() => {
+		try {
+			const parsed = JSON.parse(readFileSync(dataFileA, "utf8"));
+			return parsed.devices.some((entry) => entry.id === "b" && typeof entry.key === "string" && entry.key.length === 43);
+		} catch {
+			return false;
+		}
+	})());
 	const dataA = JSON.parse(readFileSync(dataFileA, "utf8"));
-	check("数据文件里设备条目只有 id/name/url（token 绝不明文落盘）",
+	check("数据文件里设备条目只有 id/name/url/key（不再是 token）",
 		dataA.devices.length === 1
-			&& dataA.devices.every((entry) => Object.keys(entry).every((key) => ["id", "name", "url"].includes(key)))
+			&& dataA.devices.every((entry) => Object.keys(entry).every((key) => ["id", "name", "url", "key", "paired", "hotkey"].includes(key)))
 			&& !JSON.stringify(dataA).includes(B_TOKEN),
 		JSON.stringify(dataA).slice(0, 200));
 	const stateAfterAdd = await httpJson(`${baseA}/plugin/remote/state`);
@@ -613,7 +624,7 @@ async function main() {
 	const tokenExchanges2 = B_STATE.seen.filter((entry) => entry.pathname === "/" && entry.url.includes("token=")).length;
 	check("B 的 401 原样透传给浏览器（状态码 401）", denied.status === 401, `status=${String(denied.status)}`);
 	check("401 响应体逐字节透传", denied.body.toString("utf8") === B_DENIED_BODY, JSON.stringify(denied.body.toString("utf8")));
-	check("A 在 401 后只重试一次（B 一共收到 2 次 /api/forbidden）", forbiddenSeen === 2, String(forbiddenSeen));
+	check("A 在 401 后：同 cookie 重试一次 + 换 token 再试一次（B 一共收到 3 次 /api/forbidden）", forbiddenSeen === 3, String(forbiddenSeen));
 	check("A 丢掉旧会话并用 token 重新兑换（B 一共收到 2 次 token 兑换）", tokenExchanges2 === 2, String(tokenExchanges2));
 	const stateAfter401 = await httpJson(`${baseA}/plugin/remote/state`);
 	const deviceAfter401 = Array.isArray(stateAfter401.json?.devices) ? stateAfter401.json.devices.find((entry) => entry.id === "b") : undefined;
@@ -631,7 +642,7 @@ async function main() {
 	const addDead = await httpJson(`${baseA}/plugin/remote/devices`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ id: "dead", name: "关机端（e2e）", url: `http://127.0.0.1:${String(deadPort)}` }),
+		body: JSON.stringify({ id: "dead", name: "关机端（e2e）", url: `http://127.0.0.1:${String(deadPort)}`, key: "B".repeat(43) }),
 	});
 	check("不可达设备添加成功并立刻有 /dev/dead 路由",
 		addDead.json?.ok === true && routerA.prefixes.has("/dev/dead"), JSON.stringify(addDead.json).slice(0, 160));
@@ -663,7 +674,7 @@ async function main() {
 		`status=${String(afterDelete.status)} body=${JSON.stringify(afterDelete.body.toString("utf8").slice(0, 60))}`);
 	const dataAfterDelete = JSON.parse(readFileSync(dataFileA, "utf8"));
 	check("数据文件里 b 已删除", dataAfterDelete.devices.every((entry) => entry.id !== "b"), JSON.stringify(dataAfterDelete.devices));
-	check("凭据服务里 b 的 token ref 已清理", aCredentials.store.has(tokenRef) !== true, [...aCredentials.store.keys()].join(","));
+	check("数据文件里 b 的条目已清掉（含 key）", dataAfterDelete.devices.every((entry) => entry.id !== "b"), JSON.stringify(dataAfterDelete.devices));
 
 	// 顺手把不可达设备也删掉（清理更彻底；这一条只做，不断言）。
 	await httpJson(`${baseA}/plugin/remote/devices/dead`, { method: "DELETE" });

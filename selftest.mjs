@@ -5560,7 +5560,7 @@ check("unrefTimer：有 unref 就调；null / 没有 unref 的桩也不炸（老
 		&& JSON.stringify(Object.keys(viewResp.json).sort()) === JSON.stringify(["at", "peers", "self", "version"]),
 		JSON.stringify(Object.keys(viewResp.json ?? {})).slice(0, 140));
 	check("version = 本机 dsh-remote 的版本号（internals.VERSION，与 package.json 的对账在 T0）",
-		viewResp.json?.version === internals.VERSION && internals.VERSION === "0.25.7",
+		viewResp.json?.version === internals.VERSION && internals.VERSION === "0.25.8",
 		String(viewResp.json?.version));
 	check("self / peers 与页面口**逐字段同形**（同一个 builder：键集与对端 id 完全一致；`at` 这类时间戳本来就每次都变）",
 		JSON.stringify(Object.keys(viewResp.json?.self ?? {}).sort()) === JSON.stringify(Object.keys(liveJson?.self ?? {}).sort())

@@ -1234,9 +1234,10 @@ check("设备管理：真 <table>、6 列表头、三态可达、最近错误/�
 	assert(allText.includes("上次成功："), "应显示最近一次成功时间");
 	assert(allText.includes("当前设备：本机"), "本机状态由顶部标题显示");
 	assert(allText.includes("本机") && allText.includes("远端"), "位置列要区分本机/远端");
-	assertEqual(findAll(tree, (node) => node.type === "table").length, 1, "必须是真 <table>");
-	assertEqual(findAll(tree, (node) => node.type === "th").length, 6, "6 列表头");
-	assertEqual(findAll(tree, (node) => node.type === "td").length, 12, "2 台远端设备 × 6 列（本机条不在表里）");
+	assertEqual(findAll(tree, (node) => node.type === "table").length, 0, "改成卡片列表（不再用 table）");
+	assertEqual(findAll(tree, (node) => node.props && typeof node.props.key === "string" && node.props.key.indexOf("device-") === 0).length, 2, "两台远端各一张卡");
+	assertEqual(findAll(tree, (node) => node.type === "th").length, 0, "卡片布局没有表头");
+	assertEqual(findAll(tree, (node) => node.type === "td").length, 0, "卡片布局没有 td");
 });
 
 check("0.13.1 回退：设置页没有「本机设备密钥」/「认证」列（回到 token 单一机制）", async () => {
@@ -1251,8 +1252,8 @@ check("设备管理：操作按钮齐全，新增表单只有名称与地址（�
 	const { tree } = await connectionPage();
 	const allText = collectText(tree);
 	assert(findButton(tree, "返回本机") !== undefined, "设备管理标题栏应有「返回本机」");
-	assertEqual(findAllButtons(tree, "切换到此设备").length, 2, "两台远端各一个「切换到此设备」");
-	assertEqual(findAllButtons(tree, "测试连通").length, 2, "两台远端各一个测试按钮");
+	assertEqual(findAllButtons(tree, "切换").length, 2, "两台远端各一个「切换」");
+	assertEqual(findAllButtons(tree, "测试").length, 2, "两台远端各一个测试按钮");
 	assertEqual(findAllButtons(tree, "修改").length, 2, "两台远端各一个修改按钮");
 	assertEqual(findAllButtons(tree, "删除").length, 2, "两台远端各一个删除按钮");
 	assertEqual(findAllButtons(tree, "↑").length, 2, "两台远端各一个上移按钮");
@@ -1518,7 +1519,7 @@ check("切换到此设备：写 dsh-device-switch:current = 该行 id + location
 	const { sandbox, tree } = await connectionPage();
 	// 第一个「切换到此设备」属于第 2 行（vps）。历史上行内 var 让所有按钮共享绑定，
 	// 这里点下去会写成最后一台（laptop）—— 这条断言就是这个回归的哨兵。
-	clickNth(tree, "切换到此设备", 0);
+	clickNth(tree, "切换", 0);
 	const ops = sandbox.localStorage.log.filter((entry) => entry.key === "dsh-device-switch:current");
 	assertEqual(ops.length, 1, "应恰好写一次这个键");
 	assertEqual(ops[0].op, "set", "应是 setItem");
@@ -1540,7 +1541,7 @@ check("返回本机（标题栏按钮）：removeItem 那个键 + location.reloa
 
 check("测试连通：POST /test/<id>，两段式「测试中… → ✅ 连通 状态码/耗时」", async () => {
 	const { sandbox, tree } = await connectionPage({ responses: { "/plugin/remote/test/vps": { ok: true, status: 200, ms: 42 } } });
-	clickNth(tree, "测试连通", 0); // 第 1 个测试按钮 = vps
+	clickNth(tree, "测试", 0); // 第 1 个测试按钮 = vps
 	const pendingTree = rerender(sandbox);
 	assert(collectText(pendingTree).includes("测试中…"), "点击后应先显示「测试中…」");
 	const rendered = await sandbox.settleRenders(page(sandbox).component);
@@ -1557,7 +1558,7 @@ check("测试连通：宿主半回 ok:false（HTTP 200 的测试结果）→「�
 	const { sandbox, tree } = await connectionPage({
 		responses: { "/plugin/remote/test/vps": { ok: false, status: null, ms: 7, error: "connect ECONNREFUSED" } },
 	});
-	clickNth(tree, "测试连通", 0);
+	clickNth(tree, "测试", 0);
 	const rendered = await sandbox.settleRenders(page(sandbox).component);
 	const allText = collectText(rendered.tree);
 	assert(allText.includes("❌ 不通"), `应显示「❌ 不通」，实际：${allText.slice(0, 300)}`);
@@ -1770,18 +1771,29 @@ check("新增表单：地址里没有 token 时给中文提示、不发请求", 
 	assert(collectText(rerender(sandbox)).includes("地址里要带 token"), "应提示地址里要带 token");
 });
 
-check("修改：点某行的「修改」→ 在该行下方展开修改表单（地址回填、提交带 id）", async () => {
-	const { sandbox, tree } = await connectionPage();
-	clickNth(tree, "修改", 1); // 选 vps 那行
+check("修改：点卡片「修改」→ 名称/地址变可编辑，保存时带 id 提交", async () => {
+	const { sandbox, tree } = await connectionPage({ responses: { "/plugin/remote/devices": { ok: true } } });
+	clickNth(tree, "修改", 0);
 	await settle();
 	const rendered = rerender(sandbox);
-	const allText = collectText(rendered);
-	assert(allText.includes("收起"), "点「修改」后该行按钮应变成「收起」");
-	assert(SOURCE.includes('key: "edit-" + editRowId'), "修改表单应作为独立行插在该行下方");
-	assert(SOURCE.includes("colSpan: 6"), "编辑行占满整行，不改动原行布局");
-	const addressInputs = findAll(rendered, (node) => node.type === "input");
-	assert(SOURCE.includes("device: asObject(devices[index])"), "行内编辑应把该行设备传给表单");
-	assert(SOURCE.includes('if (isEdit === true) payload.id = form.id'), "提交时必须带上 id");
+	assert(findButtonExact(rendered, "保存") !== undefined, "点「修改」后应出现「保存」");
+	assert(findButtonExact(rendered, "取消") !== undefined, "点「修改」后应出现「取消」");
+	const inputs = findAll(rendered, (node) => node.type === "input");
+	assert(inputs.length >= 2, "名称与地址都应是输入框");
+	const addressInput = inputs.filter((node) => /^https?:\/\//u.test(String(node.props.value)))[0];
+	assert(addressInput !== undefined, "地址输入框回填");
+	const nameInput = inputs.filter((node) => node !== addressInput && typeof node.props.value === "string" && node.props.value !== "")[0];
+	assert(nameInput !== undefined, "名称输入框回填");
+	nameInput.props.onChange({ target: { value: "改后的名字" } });
+	const filled = rerender(sandbox);
+	clickNth(filled, "保存", 0);
+	await settle();
+	const post = findBy(sandbox.fetchCalls, (entry) => entry.url === "/plugin/remote/devices" && entry.init.method === "POST");
+	assert(post !== undefined, "保存应 POST /devices");
+	const body = JSON.parse(post.init.body);
+	assertEqual(body.id, "vps", "必须带上被编辑卡片的 id");
+	assertEqual(body.name, "改后的名字", "名称已改");
+	assert(String(body.url).indexOf("http://") === 0, "url 来自回填的地址");
 });
 
 check("复制按钮：点击调用 clipboard.writeText，按钮先「已复制」、1.5s 后复位", async () => {
@@ -2407,10 +2419,10 @@ check("形态是构建产物格式：window.__ModuleLoader__.load 包住 factory
 });
 
 check("修复①：设备表每行按钮用**每行独立闭包**（覆盖历史回归）", () => {
-	assert(SOURCE.includes("(function buildRow(device) {"), "每行必须在自己的函数作用域里造");
-	assert(SOURCE.includes("})(asObject(devices[index])),"), "buildRow 必须被立即执行并传入**当前行**");
-	assert(SOURCE.includes('var switching = isLocal ? currentId !== "" : currentId !== id;'), "switching 必须是行内局部量");
-	assert(SOURCE.includes('applyDeviceSwitch(isLocal ? "" : id)'), "切换必须用该行闭包里的 id");
+	assert(SOURCE.includes("(function buildCard(device) {"), "每张卡必须在自己的函数作用域里造");
+	assert(SOURCE.includes("})(deviceEntries[ci]);"), "buildCard 必须被立即执行并传入**当前设备**");
+	assert(SOURCE.includes("var switching = isCurrent !== true;"), "switching 必须是行内局部量");
+	assert(SOURCE.includes("applyDeviceSwitch(id)"), "切换必须用该卡闭包里的 id");
 	assert(SOURCE.includes("removeDevice(device)"), "删除必须用该行闭包里的 device");
 });
 
